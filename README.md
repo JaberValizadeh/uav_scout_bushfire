@@ -45,9 +45,55 @@ and [Driving](#driving-move_base-and-the-fires-it-could-not-see).
 
 ---
 
+## Requirements and install
+
+Ubuntu 20.04, **ROS Noetic** and Gazebo 11. hector_quadrotor and the packages around it are not released as Noetic debs, so the workspace is a source build:
+
+```bash
+mkdir -p ~/uav_ws/src && cd ~/uav_ws/src
+git clone https://github.com/ros-geographic-info/unique_identifier.git
+git clone https://github.com/ros-geographic-info/geographic_info.git
+git clone https://github.com/RAFALAMAO/hector-quadrotor-noetic.git
+git clone https://github.com/JaberValizadeh/uav_bushfire.git
+git clone https://github.com/JaberValizadeh/uav_scout_bushfire.git
+
+cd ~/uav_ws
+rosdep install --from-paths src --ignore-src -r -y
+catkin_make --pkg uuid_msgs unique_id geographic_msgs geodesy
+catkin_make
+```
+
+The two-stage build is not optional. `hector_pose_estimation_core` includes `geographic_msgs` headers without declaring a dependency on the target that generates them, so a single parallel build races and fails on the first pass.
+
+The Scout tenders also need `scout_description` and `scout_gazebo` at runtime, from a separate catkin workspace at `~/scout_ws` (`~/scout_ws/src/scout_ros`). Build that workspace on its own; it is put on the search paths below rather than sourced, because sourcing two workspaces' `devel/setup.bash` keeps only the last one.
+
+### Environment
+
+The commands in this README source `setup_coop.bash` (in this repo), which in turn sources `~/uav_ws/src/uav_pick_place/setup_uav.bash` from the author's workspace. That package is not published, so if you do not have it, use this in every terminal instead:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/uav_ws/devel/setup.bash
+
+# hector's Gazebo plugins
+export GAZEBO_PLUGIN_PATH=$HOME/uav_ws/devel/lib:${GAZEBO_PLUGIN_PATH:-}
+# the quadrotor meshes, for package:// URIs in the URDF
+export GAZEBO_MODEL_PATH=$HOME/uav_ws/src/hector-quadrotor-noetic:${GAZEBO_MODEL_PATH:-}
+
+# ~/scout_ws, for scout_description and scout_gazebo
+export CMAKE_PREFIX_PATH=$HOME/scout_ws/devel:$CMAKE_PREFIX_PATH
+export ROS_PACKAGE_PATH=$HOME/scout_ws/src:$HOME/scout_ws/devel/share:$ROS_PACKAGE_PATH
+export PYTHONPATH=$HOME/scout_ws/devel/lib/python3/dist-packages:$PYTHONPATH
+export LD_LIBRARY_PATH=$HOME/scout_ws/devel/lib:$LD_LIBRARY_PATH
+export GAZEBO_MODEL_PATH=$HOME/scout_ws/src/scout_ros:$GAZEBO_MODEL_PATH
+source ~/uav_ws/devel/setup.bash --extend
+```
+
+---
+
 ## What the cooperation actually is
 
-[`uav_bushfire`](../uav_bushfire) is this package's parent, and in it water is
+[`uav_bushfire`](https://github.com/JaberValizadeh/uav_bushfire) is this package's parent, and in it water is
 infinite: a drone descends onto a fire and bombs until the fire is out. Here the
 tank runs out, and that one change is the whole scenario.
 
@@ -432,14 +478,14 @@ off towards a tender that has not yet stopped.
 
 Everything else — `collect_dist`, `work_per_intensity`, `join_deadline`, the
 crew ring geometry, the flame model — is carried over from
-[`uav_bushfire`](../uav_bushfire), where it is documented along with the six
+[`uav_bushfire`](https://github.com/JaberValizadeh/uav_bushfire), where it is documented along with the six
 bugs that produced it.
 
 ## Choosing a fire: biggest first
 
 A fire's **intensity is both its value and its size**, and the value is split
 equally between the drones that chose it — a 9 worked by three pays 3 each. That
-mechanic comes from [`uav_bushfire`](../uav_bushfire); what is different here is
+mechanic comes from [`uav_bushfire`](https://github.com/JaberValizadeh/uav_bushfire); what is different here is
 the ordering.
 
 `_utility()` scores **share per second**, which is the efficient answer: it
@@ -591,7 +637,7 @@ did the work.
 
 ## Related packages
 
-* [`uav_bushfire`](../uav_bushfire) — the same fire ground with drones only, and
+* [`uav_bushfire`](https://github.com/JaberValizadeh/uav_bushfire) — the same fire ground with drones only, and
   where the coalition mechanic, the flame model and most of the flying come from.
-* [`uav_pick_place`](../uav_pick_place) — the same airframe with a gripper.
+* `uav_pick_place` — the same airframe with a gripper.
 * `scout_mini_voice_control` — the Scout, flown by talking to it, in `~/scout_ws`.
