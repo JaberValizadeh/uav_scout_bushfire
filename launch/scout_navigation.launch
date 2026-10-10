@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<!-- move_base for one Scout, inside its own namespace.
+
+     Included by one_scout.launch when nav:=true. The map itself is not here -
+     there is one map_server for the whole incident, started by
+     bushfire_coop.launch, and every robot's static layer subscribes to the
+     same /map. That is the sharing: one survey of the fire ground, however
+     many vehicles.
+
+     Localisation, and why there is no AMCL
+     ......................................
+     Because there is nothing for it to correct. This robot is driven by
+     libgazebo_ros_planar_move, which publishes odometry taken from the model's
+     true pose in Gazebo, in world coordinates - and the map was generated from
+     the same world coordinates, so the map frame and the world frame are the
+     same frame. map -> <ns>/odom is therefore exactly identity, and a static
+     transform states that instead of a particle filter spending CPU
+     rediscovering it every scan.
+
+     That is a simulation shortcut and it is worth being honest about which
+     part is real: the *planning* and the *obstacle avoidance* are the genuine
+     article, running on a real costmap built from a real scan. Only the pose
+     estimate is free. On hardware this file would run amcl here instead,
+     against the same shared map, and nothing else would change - which is why
+     the frames are named and namespaced as if it did.
+-->
+<launch>
+  <arg name="ns" doc="Namespace of this Scout, e.g. scout_0" />
+
+  <!-- map -> odom. Identity, for the reason in the header. Published per robot
+       rather than once because each Scout has its own odom frame. -->
+  <node name="map_to_odom" pkg="tf2_ros" type="static_transform_publisher"
+        args="0 0 0 0 0 0 map $(arg ns)/odom" />
+
+  <node pkg="move_base" type="move_base" respawn="false" name="move_base"
+        output="screen">
+    <rosparam file="$(find uav_scout_bushfire)/config/move_base_params.yaml"
+              command="load" />
+    <rosparam file="$(find uav_scout_bushfire)/config/dwa_local_planner_params.yaml"
+              command="load" />
+
+    <!-- The common params are loaded into both costmaps, which is what the
+         navigation stack expects and the reason the file has no top-level key
+         of its own. -->
+    <rosparam file="$(find uav_scout_bushfire)/config/costmap_common_params.yaml"
+              command="load" ns="global_costmap" />
+    <rosparam file="$(find uav_scout_bushfire)/config/costmap_common_params.yaml"
+              command="load" ns="local_costmap" />
+
+    <rosparam file="$(find uav_scout_bushfire)/config/global_costmap_params.yaml"
+              command="load" />
+    <rosparam file="$(find uav_scout_bushfire)/config/local_costmap_params.yaml"
+              command="load" />
+
+    <!-- The two frames that cannot live in a shared yaml, because they carry
+         this robot's namespace. The local costmap rolls in the odom frame -
+         not map - so that a momentary jump in localisation cannot drag the
+         window out from under the local planner. -->
+    <param name="global_costmap/robot_base_frame" value="$(arg ns)/base_link" />
+    <param name="local_costmap/robot_base_frame"  value="$(arg ns)/base_link" />
+    <param name="local_costmap/global_frame"      value="$(arg ns)/odom" />
+  </node>
+
+</launch>

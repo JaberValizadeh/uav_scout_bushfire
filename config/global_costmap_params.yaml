@@ -1,0 +1,20 @@
+# Planning over the shared static map, in the map frame.
+global_costmap:
+  global_frame: map
+  # robot_base_frame is set per robot in scout_navigation.launch, because it
+  # carries the namespace prefix and this file is shared.
+  update_frequency: 2.0
+  publish_frequency: 1.0
+  transform_tolerance: 0.5
+
+  static_map: true
+  rolling_window: false
+
+  # static first, then the laser, then inflate the result. Order matters: the
+  # obstacle layer has to be able to add the *other Scout* - which is not in
+  # the static map and is only visible at all because of the visibility pole -
+  # before anything is inflated around it.
+  plugins:
+    - {name: static_layer,    type: "costmap_2d::StaticLayer"}
+    - {name: obstacle_layer,  type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}

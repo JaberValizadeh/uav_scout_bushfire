@@ -1,0 +1,49 @@
+# One of these per Scout, inside its own namespace.
+shutdown_costmaps: false
+controller_frequency: 8.0
+planner_frequency: 1.0
+controller_patience: 4.0
+planner_patience: 4.0
+
+# A tender that cannot reach its standing point should give up reasonably
+# quickly and let water_tender pick another one, rather than grinding through
+# every recovery behaviour. There is almost always a second-best fire to stand
+# beside, and the fleet is waiting on this vehicle.
+oscillation_timeout: 8.0
+oscillation_distance: 0.3
+max_planning_retries: 3
+
+# navfn, not global_planner/GlobalPlanner.
+#
+# This is the one line that decided whether any of this ran. The navigation
+# stack on this machine is a partial install: move_base, costmap_2d, amcl,
+# gmapping, dwa_local_planner and map_server are all present, but the
+# `global_planner` package is not. move_base loads its global planner as a
+# pluginlib plugin at startup, so naming a plugin from a package that is not
+# there is not a warning and not a fallback - the node exits 1 before it writes
+# a log line, and the tenders sit printing "waiting for move_base..." forever
+# with nothing to say what went wrong.
+#
+# navfn/NavfnROS is the classic ROS global planner, it is installed, and for a
+# 20 m arena of round trunks the difference between it and GlobalPlanner is not
+# something this scenario can see: both are grid Dijkstra/A* over the same
+# costmap. If global_planner is ever installed, the block below still applies.
+base_global_planner: "navfn/NavfnROS"
+base_local_planner: "dwa_local_planner/DWAPlannerROS"
+
+recovery_behavior_enabled: true
+clearing_rotation_allowed: true
+
+NavfnROS:
+  # Tolerance on the goal, matching what GlobalPlanner was given: a standing
+  # point 0.3 m off is still beside the right fire.
+  default_tolerance: 0.3
+  visualize_potential: false
+
+# Kept for the day global_planner is installed; ignored by navfn.
+GlobalPlanner:
+  use_dijkstra: true
+  use_quadratic: true
+  use_grid_path: false
+  allow_unknown: false
+  default_tolerance: 0.3

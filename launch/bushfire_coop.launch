@@ -1,0 +1,391 @@
+<?xml version="1.0"?>
+<!--
+  bushfire_coop.launch
+  ====================
+  Three hector quadrotors and two AgileX Scout V2 ground robots fighting a
+  bushfire together, in the stand of timber from uav_bushfire.
+
+  The cooperation is water. A drone carries about ten seconds of bombing, which
+  is less than a big fire needs; the scouts are mobile water points that drive
+  to where the aircraft are working; and the dam in the corner is the only
+  inexhaustible thing in the world, so the scouts have to keep going back to it.
+
+      dam   ->    scout tender   ->    drone   ->    fire
+
+  Every arrow is a rendezvous between two vehicles that had to get to the same
+  place. Neither fleet can work the fire ground alone: without tenders the
+  drones each get one tank and then hover over fires achieving nothing, and the
+  scouts cannot put out a fire at all.
+
+    Global:
+      1. Gazebo + uav_bushfire's world (12 x 12 m stand, eight trees)
+      2. incident_controller - fires, crews, payouts, and the water ledger
+      3. coop_monitor        - the whole supply chain, one screen
+
+    Per drone (uav_0..2), from one_uav.launch:
+      4. the airframe with its laser mast, plugins and controller/twist
+      5. fire_suppressor - chooses fires, bombs them, and flies for water
+
+    Per scout (scout_0..1), from one_scout.launch:
+      6. the Scout with a laser boom, its ros_control stack and skid-steer node
+      7. water_tender - stands where the work is, dispenses, refills at the dam
+
+  Usage:
+    source ~/uav_ws/src/uav_scout_bushfire/setup_coop.bash
+    roslaunch uav_scout_bushfire bushfire_coop.launch
+    roslaunch uav_scout_bushfire bushfire_coop.launch gui:=false
+    roslaunch uav_scout_bushfire bushfire_coop.launch rviz:=true
+
+  setup_coop.bash rather than setup_uav.bash: this is the one package in
+  ~/uav_ws that needs ~/scout_ws packages at *runtime* - scout_description for
+  the robot and scout_gazebo for the controller config and the skid-steer node.
+
+  Topics:
+    /bushfire/hotspots            every fire, with its value and crew
+    /bushfire/water               every tank, and where the dam is
+    /bushfire/claims              which fire each drone has chosen
+    /bushfire/tenders             where each scout intends to stand
+    /uav_0/bushfire/target        uav_0's job and its station on it
+    /uav_0/cmd_vel                body-frame velocity command
+    /scout_0/cmd_vel              body-frame drive command
+    /scout_0/odom                 ground-truth pose
+-->
+<launch>
+
+  <arg name="gui"      default="true" />
+  <arg name="headless" default="false" />
+  <arg name="rviz"        default="false" />
+  <arg name="rviz_config" default="$(find uav_scout_bushfire)/rviz/coop.rviz" />
+
+  <!-- A 20 x 20 m stand, three times the area of uav_bushfire's 12 x 12. The
+       ground fleet is why: a Scout crosses a 12 m arena in a few seconds, so
+       the tenders were always already where they needed to be and the
+       logistics half of the scenario cost nothing. The dam is not in the world
+       file - incident_controller spawns it, so ~dam_x/~dam_y stay the one
+       authority on where the water is. -->
+  <arg name="world" default="$(find uav_scout_bushfire)/worlds/bushfire_big.world" />
+
+  <!-- Path planning for the ground fleet. Needs the ROS navigation stack:
+         sudo apt install ros-noetic-navigation
+       With nav:=false the tenders drive with the reactive laser controller
+       built into water_tender instead, which needs nothing extra. -->
+  <arg name="nav" default="true" />
+
+  <arg name="num_hotspots"    default="7" />
+  <arg name="world_half_size" default="7.0" />
+
+  <!-- ================== water: the whole cooperation ==================
+       These five numbers decide whether this is a scenario or three drones
+       that never need anybody, so they are worth reading together.
+
+       A drone tank of 40 L at 4 L/s is 10 seconds of bombing. A fire costs
+       intensity x 1.2 drone-seconds, so one tank finishes a fire of about 8
+       and no more - every 9 and 10 on the board needs either a crew or a
+       refill, which is exactly the point. A tender carries 240 L, six drone
+       loads, and gives them out at 20 L/s (two seconds a drone). It draws from
+       the dam at 60 L/s, three times faster than it dispenses, because the
+       queue this scenario is meant to be about is the one at the tender, not
+       the one at the dam. -->
+  <arg name="tank_capacity"   default="40.0" />
+  <arg name="tender_capacity" default="240.0" />
+  <arg name="flow_rate"       default="4.0" />
+  <arg name="refill_rate"     default="20.0" />
+  <arg name="dam_rate"        default="60.0" />
+
+  <!-- Where the water is. The far corner, clear of every tree (the nearest are
+       nearest trunk is 2.8 m away) and inside the firebreak at +-10. Out in
+       the corner on purpose: it is a 12 m drive from the far side of the
+       stand, so leaving for it at the wrong moment is a decision with a cost.
+       A dam among the fires would make the tenders' job trivial and the drones
+       would barely notice there was a supply chain. -->
+  <arg name="dam_x"      default="8.5" />
+  <arg name="dam_y"      default="8.5" />
+  <arg name="dam_radius" default="2.00" />
+
+  <!-- The refill rendezvous. A drone counts as taking water when it is within
+       refill_radius of a *stopped* tender and inside the altitude band - the
+       same shape as the suppression test, and the floor is load-bearing for
+       the same reason: without it a drone sitting on the ground beside a
+       tender refuels. -->
+  <arg name="refill_radius"       default="0.90" />
+  <arg name="refill_altitude"     default="1.55" />
+  <arg name="refill_min_altitude" default="0.60" />
+  <arg name="tender_still"        default="0.08" />
+
+  <!-- Below this a drone tops up before bidding on a new fire. -->
+  <arg name="reserve_litres" default="12.0" />
+
+  <!-- ======================= the fire ground =========================
+       Carried over from uav_bushfire unchanged; see that package's launch for
+       why each of these is the number it is. -->
+  <arg name="collect_dist"      default="1.00" />
+  <arg name="suppress_altitude" default="1.45" />
+  <arg name="drop_altitude"     default="0.95" />
+  <arg name="min_drop_altitude" default="0.45" />
+  <arg name="work_per_intensity" default="1.2" />
+  <arg name="max_crew"          default="3" />
+  <arg name="join_deadline"     default="0.7" />
+  <arg name="crew_separation"   default="1.00" />
+  <arg name="crew_altitude_step" default="0.15" />
+  <arg name="extinguish_pause"  default="1.5" />
+  <arg name="flame_scale"       default="1.0" />
+  <arg name="fire_light"        default="true" />
+  <arg name="flicker_hz"        default="4.0" />
+
+  <!-- A drone that runs dry mid-job flies to a tender, waits for it to stand
+       if it is moving, fills and flies back. That is legitimately a long time
+       off station, and timing it out would take a fire off a drone for doing
+       exactly what this scenario asks of it. -->
+  <arg name="commit_timeout" default="180.0" />
+
+  <!-- The trees, plus the dam - the controller must not light a fire in the
+       pond, and a tender parked at the dam should not have a fire beside it.
+       Keep the tree entries in step with worlds/bushfire_big.world, which
+       generated them. -->
+  <arg name="obstacles"
+       default="[[4.00, 0.00, 0.35],
+                 [2.00, 3.46, 0.35],
+                 [-2.00, 3.46, 0.35],
+                 [-4.00, 0.00, 0.35],
+                 [-2.00, -3.46, 0.35],
+                 [2.00, -3.46, 0.35],
+                 [7.39, 3.06, 0.35],
+                 [3.06, 7.39, 0.35],
+                 [-3.06, 7.39, 0.35],
+                 [-7.39, 3.06, 0.35],
+                 [-7.39, -3.06, 0.35],
+                 [-3.06, -7.39, 0.35],
+                 [3.06, -7.39, 0.35],
+                 [7.39, -3.06, 0.35],
+                 [4.38, 4.38, 0.35],
+                 [-4.38, 4.38, 0.35],
+                 [-4.38, -4.38, 0.35],
+                 [4.38, -4.38, 0.35],
+                 [8.50, 8.50, 1.90]]" />
+
+  <!-- Transit lanes. Lane 0 at 1.85, then 2.30 and 2.75 - three aircraft
+       between the suppression ceiling (1.45, below which a transiting drone
+       would register as bombing what it flew over) and the top of the trunks
+       3.0, above which it stops having to avoid anything). 0.40 m a lane is
+       more than the airframe is tall, so two drones in different lanes cannot
+       touch however their paths cross. Every collision measured before lanes
+       existed was a pair at the single shared cruise altitude.
+
+       The ceiling is tighter than the trunk height suggests, and the reason is
+       the laser: it sits on a mast 0.25 m ABOVE the airframe, so the scan
+       plane is always cruise + 0.25. The first version of this put lane 2 at
+       2.75 and therefore its scan plane at exactly 3.00 - the top of the
+       trunks - and that drone went blind to trees. Measured: 31 tree contacts
+       for lane 2 against 20 for lane 1 and 8 for lane 0, the gradient
+       following the lane order exactly. Lanes now top out at 2.50, which puts
+       the highest scan plane at 2.75 with a quarter of a metre of trunk still
+       above it. -->
+  <arg name="cruise_altitude" default="1.70" />
+  <arg name="cruise_step"     default="0.40" />
+  <arg name="linear_speed"    default="1.2" />
+  <arg name="angular_gain"    default="2.0" />
+  <arg name="arrive_radius"   default="0.60" />
+  <arg name="avoid_dist"      default="1.6" />
+  <arg name="stop_dist"       default="0.9" />
+
+  <!-- ============================== Gazebo ============================== -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name"   value="$(arg world)" />
+    <arg name="gui"          value="$(arg gui)" />
+    <arg name="headless"     value="$(arg headless)" />
+    <arg name="paused"       value="false" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="debug"        value="false" />
+  </include>
+
+  <!-- ============================ the aircraft ==========================
+       Spread along the y axis in the clear middle of the stand, 2.2 m apart. -->
+  <group ns="uav_0">
+    <include file="$(find uav_scout_bushfire)/launch/one_uav.launch">
+      <arg name="ns" value="uav_0" /><arg name="hold_index" value="0" />
+      <arg name="cruise_step" value="$(arg cruise_step)" /><arg name="x" value="0.0" /><arg name="y" value="0.0" />
+      <arg name="cruise_altitude" value="$(arg cruise_altitude)" />
+      <arg name="drop_altitude"   value="$(arg drop_altitude)" />
+      <arg name="linear_speed"    value="$(arg linear_speed)" />
+      <arg name="angular_gain"    value="$(arg angular_gain)" />
+      <arg name="avoid_dist"      value="$(arg avoid_dist)" />
+      <arg name="stop_dist"       value="$(arg stop_dist)" />
+      <arg name="arrive_radius"   value="$(arg arrive_radius)" />
+      <arg name="max_crew"        value="$(arg max_crew)" />
+      <arg name="join_deadline"   value="$(arg join_deadline)" />
+      <arg name="reserve_litres"  value="$(arg reserve_litres)" />
+    </include>
+  </group>
+
+  <group ns="uav_1">
+    <include file="$(find uav_scout_bushfire)/launch/one_uav.launch">
+      <arg name="ns" value="uav_1" /><arg name="hold_index" value="1" />
+      <arg name="cruise_step" value="$(arg cruise_step)" /><arg name="x" value="0.0" /><arg name="y" value="2.2" />
+      <arg name="cruise_altitude" value="$(arg cruise_altitude)" />
+      <arg name="drop_altitude"   value="$(arg drop_altitude)" />
+      <arg name="linear_speed"    value="$(arg linear_speed)" />
+      <arg name="angular_gain"    value="$(arg angular_gain)" />
+      <arg name="avoid_dist"      value="$(arg avoid_dist)" />
+      <arg name="stop_dist"       value="$(arg stop_dist)" />
+      <arg name="arrive_radius"   value="$(arg arrive_radius)" />
+      <arg name="max_crew"        value="$(arg max_crew)" />
+      <arg name="join_deadline"   value="$(arg join_deadline)" />
+      <arg name="reserve_litres"  value="$(arg reserve_litres)" />
+    </include>
+  </group>
+
+  <group ns="uav_2">
+    <include file="$(find uav_scout_bushfire)/launch/one_uav.launch">
+      <arg name="ns" value="uav_2" /><arg name="hold_index" value="2" />
+      <arg name="cruise_step" value="$(arg cruise_step)" /><arg name="x" value="0.0" /><arg name="y" value="-2.2" />
+      <arg name="cruise_altitude" value="$(arg cruise_altitude)" />
+      <arg name="drop_altitude"   value="$(arg drop_altitude)" />
+      <arg name="linear_speed"    value="$(arg linear_speed)" />
+      <arg name="angular_gain"    value="$(arg angular_gain)" />
+      <arg name="avoid_dist"      value="$(arg avoid_dist)" />
+      <arg name="stop_dist"       value="$(arg stop_dist)" />
+      <arg name="arrive_radius"   value="$(arg arrive_radius)" />
+      <arg name="max_crew"        value="$(arg max_crew)" />
+      <arg name="join_deadline"   value="$(arg join_deadline)" />
+      <arg name="reserve_litres"  value="$(arg reserve_litres)" />
+    </include>
+  </group>
+
+  <!-- ========================== the shared map ==========================
+       One map_server for the whole incident. Every Scout's global costmap
+       subscribes to this same /map - that is what "sharing" means here: one
+       survey of the fire ground, however many vehicles read it.
+
+       The map is generated from the same numbers that built the world rather
+       than driven out with gmapping; see the README for why, and
+       launch/build_map.launch if you would rather drive one. -->
+  <node if="$(arg nav)" name="map_server" pkg="map_server" type="map_server"
+        args="$(find uav_scout_bushfire)/maps/bushfire_big.yaml">
+    <param name="frame_id" value="map" />
+  </node>
+
+  <!-- ============================ the tenders ===========================
+       Started out towards the corners of the 20 m arena rather than among the
+       trees:
+       a 50 kg skid-steer vehicle spawned between two trunks spends its first
+       ten seconds reversing out, and the aircraft are already flying by then.
+       Docking slots 0 and 1 keep them off each other at the dam. -->
+  <group ns="scout_0">
+    <include file="$(find uav_scout_bushfire)/launch/one_scout.launch">
+      <arg name="ns" value="scout_0" />
+      <arg name="x" value="6.0" /><arg name="y" value="6.0" /><arg name="yaw" value="-2.36" />
+      <arg name="dock_index" value="0" /><arg name="dock_count" value="2" />
+      <arg name="obstacles" value="$(arg obstacles)" />
+      <arg name="flame_scale" value="$(arg flame_scale)" />
+      <arg name="nav" value="$(arg nav)" />
+    </include>
+  </group>
+
+  <group ns="scout_1">
+    <include file="$(find uav_scout_bushfire)/launch/one_scout.launch">
+      <arg name="ns" value="scout_1" />
+      <arg name="x" value="-6.0" /><arg name="y" value="-6.0" /><arg name="yaw" value="0.79" />
+      <arg name="dock_index" value="1" /><arg name="dock_count" value="2" />
+      <arg name="obstacles" value="$(arg obstacles)" />
+      <arg name="flame_scale" value="$(arg flame_scale)" />
+      <arg name="nav" value="$(arg nav)" />
+    </include>
+  </group>
+
+  <!-- Fires as costmap obstacles, so move_base routes the tenders round them.
+       Without this the navigation stack cannot see fire at all and the scouts
+       drive straight through - which is what happened the moment nav:=true
+       started bypassing water_tender's own reactive fire avoidance. -->
+  <node if="$(arg nav)" pkg="uav_scout_bushfire" type="fire_costmap"
+        name="fire_costmap" output="screen">
+    <param name="flame_scale" value="$(arg flame_scale)" />
+    <param name="fire_margin" value="0.60" />
+    <param name="frame"       value="map" />
+    <rosparam param="clear_services">
+      [/scout_0/move_base/clear_costmaps, /scout_1/move_base/clear_costmaps]
+    </rosparam>
+  </node>
+
+  <!-- Measures drone-drone, drone-tree and scout-scout separations against
+       the geometry, and says which of the three is actually happening. On by
+       default: it only subscribes, and "they crash sometimes" is otherwise a
+       claim nothing here can turn into a number. -->
+  <arg name="collide" default="true" />
+  <node if="$(arg collide)" pkg="uav_bushfire" type="collision_monitor"
+        name="collision_monitor" output="screen">
+    <rosparam param="obstacles" subst_value="true">$(arg obstacles)</rosparam>
+    <param name="rotor_radius" value="0.40" />
+    <param name="drone_vsep"   value="0.30" />
+    <param name="scout_radius" value="0.45" />
+    <param name="tree_height"  value="3.00" />
+    <rosparam param="scouts">[scout_0, scout_1]</rosparam>
+  </node>
+
+  <!-- ========================= incident control =========================
+       One node, no namespace. Owns the fires, the crew register and the water
+       ledger - see the node's header for why the water lives with the fires
+       rather than in the vehicles. Held back until Gazebo has the world and
+       all five models loaded. -->
+  <node pkg="uav_scout_bushfire" type="incident_controller"
+        name="incident_controller" output="screen"
+        launch-prefix="bash -c 'sleep 14 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <rosparam param="drones">[uav_0, uav_1, uav_2]</rosparam>
+    <rosparam param="tenders">[scout_0, scout_1]</rosparam>
+
+    <param name="tank_capacity"    value="$(arg tank_capacity)" />
+    <param name="tender_capacity"  value="$(arg tender_capacity)" />
+    <param name="flow_rate"        value="$(arg flow_rate)" />
+    <param name="refill_rate"      value="$(arg refill_rate)" />
+    <param name="dam_rate"         value="$(arg dam_rate)" />
+    <param name="refill_radius"    value="$(arg refill_radius)" />
+    <param name="refill_altitude"  value="$(arg refill_altitude)" />
+    <param name="refill_min_altitude" value="$(arg refill_min_altitude)" />
+    <param name="tender_still"     value="$(arg tender_still)" />
+    <param name="dam_x"            value="$(arg dam_x)" />
+    <param name="dam_y"            value="$(arg dam_y)" />
+    <param name="dam_radius"       value="$(arg dam_radius)" />
+
+    <param name="num_hotspots"     value="$(arg num_hotspots)" />
+    <param name="world_half_size"  value="$(arg world_half_size)" />
+    <param name="collect_dist"     value="$(arg collect_dist)" />
+    <param name="suppress_altitude" value="$(arg suppress_altitude)" />
+    <param name="min_drop_altitude" value="$(arg min_drop_altitude)" />
+    <param name="work_per_intensity" value="$(arg work_per_intensity)" />
+    <param name="max_crew"         value="$(arg max_crew)" />
+    <param name="join_deadline"    value="$(arg join_deadline)" />
+    <param name="crew_separation"  value="$(arg crew_separation)" />
+    <param name="crew_altitude_step" value="$(arg crew_altitude_step)" />
+    <param name="drop_altitude"    value="$(arg drop_altitude)" />
+    <param name="max_ring"         value="0.75" />
+    <param name="commit_timeout"   value="$(arg commit_timeout)" />
+    <param name="min_separation"   value="3.0" />
+    <param name="extinguish_pause" value="$(arg extinguish_pause)" />
+    <param name="flame_scale"      value="$(arg flame_scale)" />
+    <param name="fire_light"       value="$(arg fire_light)" type="bool" />
+    <param name="flicker_hz"       value="$(arg flicker_hz)" />
+    <param name="publish_hz"       value="10.0" />
+    <param name="reignite_period"  value="120.0" />
+    <param name="obstacle_clearance" value="0.8" />
+    <rosparam param="obstacles" subst_value="true">$(arg obstacles)</rosparam>
+  </node>
+
+  <!-- One monitor for the whole incident rather than one per vehicle. The
+       question this scenario raises is "is the supply chain keeping up", and
+       that cannot be answered from inside any single vehicle. -->
+  <node pkg="uav_scout_bushfire" type="coop_monitor" name="coop_monitor"
+        output="screen"
+        launch-prefix="bash -c 'sleep 18 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="log_hz" value="0.25" />
+  </node>
+
+  <!-- The view, defined once in coop_rviz.launch so that running it here and
+       running it separately against an already-flying incident are the same
+       thing. It also carries the world -> map transform, which exists only for
+       the benefit of the display. -->
+  <include if="$(arg rviz)"
+           file="$(find uav_scout_bushfire)/launch/coop_rviz.launch">
+    <arg name="rviz_config" value="$(arg rviz_config)" />
+    <arg name="delay"       value="14" />
+  </include>
+
+</launch>

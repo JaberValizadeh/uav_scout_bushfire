@@ -1,0 +1,1503 @@
+#!/usr/bin/env python3
+"""
+incident_controller - the fire ground, the crew register, and the water ledger.
+
+One of these runs for the whole incident. It is uav_bushfire's fire_spotter
+with the thing that makes this scenario a *cooperation* bolted into the middle
+of it: water is finite, and it only reaches a fire by being carried there in
+stages by two different kinds of vehicle.
+
+    dam  --->  scout tender  --->  drone  --->  fire
+
+Every arrow is a physical rendezvous between two vehicles that had to drive or
+fly to the same place, and every link but the first is finite. A drone holds
+~tank_capacity litres, which at ~flow_rate is about ten seconds of bombing -
+less than a big fire needs, on purpose, so no fire above about an 8 can be put
+out by one drone on one tank. A tender holds ~tender_capacity, about six drone
+loads. The dam is the only inexhaustible thing in the world, and it does not
+move, so the tenders have to keep going back to it.
+
+Why the ledger owns the water
+-----------------------------
+It could have gone in the vehicles - each one knows when it is bombing or
+filling. It is here because a transfer has two parties and a shared quantity,
+and the two parties are separate nodes: a drone that decided for itself that it
+had taken 40 litres, and a tender that decided for itself that it had given 30,
+would both be sincerely wrong and nothing would ever notice. The same reasoning
+put the crew register here rather than in the drones - see "Who chooses" below.
+Local decisions, central bookkeeping.
+
+It also has to be here for a duller reason: this node is already the thing that
+computes, every tick, which drones are on station over which fire. Bombing
+*is* the water consumption, so metering it anywhere else would mean a second
+node deriving the same fact a tenth of a second later.
+
+What it owns
+------------
+A fixed pool of ~num_hotspots slots. A slot is either burning - it has a
+position, a value and a Gazebo model in the world - or it is out, in which case
+it has no model, is not on the board, and is waiting out ~extinguish_pause
+before lighting somewhere else. The pool is fixed so the fire ground never
+empties and the fleet never runs out of work, but the fires themselves come and
+go: putting one out **deletes its model**, and the one that lights afterwards is
+a new model, built to its own size. See _extinguish() for why that is safe here
+when the naive version of it is not.
+
+What a fire looks like
+----------------------
+Its intensity drives its geometry, not just its payout: _flame_sdf() builds a
+model whose flame height, ember bed, smoke column and light radius all scale
+with the number. A 10 is a bonfire that lights the trunks around it; a 1 is a
+smoulder. Before this, every fire was the same fixed model and the only place
+size appeared was an RViz marker - so the single most important number in the
+scenario was invisible in the window you were actually watching.
+
+What a fire is worth, and what it costs
+---------------------------------------
+Its intensity, 1 to 10, is one number doing two jobs:
+
+  value   the fire pays `intensity`, split equally between every drone that
+          chose it. Three drones on a 9 get 3 each.
+  size    it takes `intensity * ~work_per_intensity` drone-seconds of
+          on-station bombing. Every crew member overhead contributes one
+          second of work per second, so a crew of n finishes in 1/n the time.
+
+Neither half is interesting alone. Split-only payout makes joining somebody
+else's fire strictly worse than taking your own, and nobody ever forms a crew.
+Work-only makes crews free, and every drone piles onto the same fire. Together
+they are a real decision with a real answer: joining halves your share but also
+halves the time, so what a drone actually maximises is share per second, and
+the fire worth crewing is the big one - which is what "bigger fires draw more
+drones" means mechanically rather than as an assertion.
+
+Who chooses
+-----------
+The drones do. This node used to compute a greedy nearest-first assignment
+every tick and push it out; it no longer assigns anything. Every aircraft sees
+the whole board on /bushfire/hotspots - position, value, work remaining, crew
+size - picks the fire with the best share-per-second for itself, and says so on
+/bushfire/claims. This node is the ledger: it accepts the claim, tracks the
+crew, meters the work, pays out and re-ignites.
+
+The reason for moving the decision is not tidiness. Nearest-first has exactly
+one fire per drone by construction, so it cannot express a crew at all, and
+"how many drones should this fire have" is not a question a distance metric
+has an opinion about.
+
+Commitment
+----------
+A claim is binding: while a drone holds a fire, its claims on anything else are
+ignored, and it is released only when the job is done. This is the opposite of
+the old behaviour, which recomputed the whole assignment every tick, and the
+reason for the reversal is crews. A drone that leaves halfway through has cost
+its crewmates the work it was supposed to contribute, so a coalition you can
+walk out of is not worth joining, so no coalition forms.
+
+Two escapes exist, both faults rather than choices. A drone that has not been
+on station for ~commit_timeout seconds is released, because a crew waiting on
+an aircraft that is stuck in a thicket or repeatedly respawning waits forever.
+And a drone that has been rescued releases its own claim (see fire_suppressor),
+since it has been teleported to its launch point and its crewmates should not
+be diluted by an aircraft that is not there.
+
+Where a crew stands
+-------------------
+Not on the fire. Two drones station-keeping on the same point is a collision -
+measured in the treasure version, which had nothing stopping two drones being
+sent to one target. So a crew of n is spread over a ring around the fire, at
+~crew_separation between neighbours, each member
+~crew_altitude_step higher than the last. The ring radius falls out of the
+chord: r = separation / (2 sin(pi/n)). Both the ring and the altitude stagger
+have to stay inside the suppression test, which is why ~collect_dist here is
+wider than a single drone would need and ~suppress_altitude has room above
+drop_altitude for the whole stack.
+
+Suppression
+-----------
+Per crew member: horizontal distance from the *fire* within ~collect_dist AND
+altitude inside the band [~min_drop_altitude, ~suppress_altitude]. The ceiling
+is the inversion of the treasure rule: there, altitude was part of the target
+and had to be matched; here the fire is on the ground and altitude is a limit
+the aircraft has to get under. A drone cruising over the fire has not put it
+out.
+
+The floor is there because "under the ceiling" is also true of an aircraft
+sitting on the ground, and a parked drone has not made a drop either. Without
+it a fire lit near a launch point is scored by a drone that has not moved yet -
+measured, two of thirty-one drops in a run were awarded at 0.18 m, four seconds
+before anybody took off. The band is a cheap way to say "flying, and low",
+which is the thing actually being tested.
+
+Passing the test no longer *ends* the fire; it means the drone is bombing, and
+the fire's work counter advances while it is. The fire ends when the counter
+fills.
+
+...and it only advances while the drone has water. That is the single line
+where this package differs from the one it grew out of, and everything else
+about the scouts exists to serve it. A dry drone on station over a fire is
+holding a perfect hover and achieving nothing.
+
+The three transfers
+-------------------
+All metered here, all the same shape - two vehicles close enough to each other,
+and a rate:
+
+  fire   <- drone    ~flow_rate litres per second of bombing. Not a transfer
+                     anybody has to arrange; it is what suppression costs.
+  drone  <- tender   the drone within ~refill_radius of the tender and between
+                     ~refill_min_altitude and ~refill_altitude - hovering over
+                     its deck - and the tender stopped, with water. Fills at
+                     ~refill_rate.
+  tender <- dam      the tender within ~dam_radius of the dam. Fills at
+                     ~dam_rate, which is much faster than it dispenses: the
+                     interesting queue in this scenario is meant to be at the
+                     tender, not at the dam.
+
+The altitude band on the middle one is the same trick as the suppression band,
+and it is load-bearing for the same reason. Without a floor, a drone sitting on
+the ground next to a tender refuels; with one, it has to be flying and low,
+which is what hovering over a deck actually is.
+
+A tender is only `ready` when it is stopped, and that is checked here from its
+odometry rather than taken on trust from the scout, because the consequence of
+getting it wrong is a drone descending onto a moving vehicle.
+
+Publications
+------------
+  /bushfire/hotspots       uav_bushfire/HotspotArray       every fire (10 Hz)
+  /bushfire/water          uav_scout_bushfire/WaterBoard   the supply chain
+  /bushfire/markers        visualization_msgs/MarkerArray  RViz
+  /<ns>/bushfire/target    uav_bushfire/Hotspot            that drone's job
+
+Subscriptions
+-------------
+  /<ns>/ground_truth/state nav_msgs/Odometry               per ns in ~drones
+  /<ns>/odom               nav_msgs/Odometry               per ns in ~tenders
+  /bushfire/claims         uav_bushfire/FireClaim          the fleet's choices
+
+Gazebo services used
+--------------------
+  /gazebo/spawn_sdf_model  /gazebo/delete_model
+  /gazebo/set_model_state  /gazebo/get_world_properties
+
+ROS Parameters (private, ~)
+---------------------------
+  ~drones             list  Namespaces in play, e.g. [uav_0, uav_1] (default [])
+  ~tenders            list  Scout namespaces, e.g. [scout_0]        (default [])
+  ~num_hotspots       int   Fires burning at once                   (default 5)
+  ~world_half_size    float Half-width of the fire ground, m        (default 4.0)
+  ~collect_dist       float Horizontal bombing radius, m            (default 1.00)
+  ~suppress_altitude  float Must be at or below this, m             (default 1.45)
+  ~min_drop_altitude  float ...and at or above this, so that a
+                            parked aircraft scores nothing, m       (default 0.45)
+  ~work_per_intensity float Drone-seconds of bombing per point of
+                            intensity                               (default 1.2)
+  ~max_crew           int   Most drones one fire will accept        (default 3)
+  ~join_deadline      float A crewed fire stops accepting new
+                            members once this fraction of its
+                            work is done                            (default 0.7)
+  ~crew_separation    float Distance between neighbouring crew
+                            stations on the ring, m                 (default 1.00)
+  ~max_ring           float Cap on the ring radius, m; must leave
+                            the ring inside ~collect_dist           (default 0.75)
+  ~drop_altitude      float Height the first crew member holds, m   (default 0.95)
+  ~crew_altitude_step float Each further member stacks this much
+                            higher, m                               (default 0.15)
+  ~commit_timeout     float Release a drone that has not been on
+                            station for this long, s; 0 disables    (default 120.0)
+
+  Water
+  -----
+  ~tank_capacity      float A drone's load, litres                  (default 40.0)
+  ~tender_capacity    float A scout's load, litres                  (default 240.0)
+  ~flow_rate          float Litres per second while bombing         (default 4.0)
+  ~refill_rate        float Litres per second, tender to drone      (default 20.0)
+  ~dam_rate           float Litres per second, dam to tender        (default 60.0)
+  ~refill_radius      float How close a drone must hover to a
+                            tender to be taking water, m            (default 0.90)
+  ~refill_altitude    float ...and no higher than this, m           (default 1.30)
+  ~refill_min_altitude float ...nor lower, so a drone parked beside
+                            a tender does not refuel, m             (default 0.45)
+  ~tender_still       float A tender is `ready` below this speed,
+                            m/s                                     (default 0.08)
+  ~dam_x, ~dam_y      float Where the standing water is             (default 5.0, 5.0)
+  ~dam_radius         float A tender this close to it is filling, m (default 1.60)
+  ~serve_radius       float A drone this close to a tender is in
+                            the queue for it, m                     (default 2.60)
+  ~serve_timeout      float Give the slot up if the nominated
+                            drone has not filled in this long, s    (default 25.0)
+  (the docking ring the tenders queue on is water_tender's ~dock_radius: it is
+   geometry a scout drives, not bookkeeping this node keeps)
+  ~min_separation     float Keep fires this far apart, m            (default 2.5)
+  ~extinguish_pause   float A suppressed slot stays out of the
+                            world and off the board this long
+                            before lighting elsewhere, s            (default 1.5)
+  ~flame_scale        float Whole-model size multiplier, for
+                            taste; intensity does the real work     (default 1.0)
+  ~fire_light         bool  Give each fire a point light. The one
+                            cue that lights anything else           (default true)
+  ~flicker_hz         float Yaw the flames at this rate to make
+                            them move; 0 disables                   (default 4.0)
+  ~publish_hz         float Publish rate in Hz                      (default 10.0)
+  ~reignite_period    float Move an untouched, uncrewed fire after
+                            this long, s                            (default 120.0)
+  ~obstacles          list  [[x, y, radius], ...] to avoid          (default [])
+  ~obstacle_clearance float Extra margin around obstacles, m        (default 0.8)
+"""
+
+import math
+import random
+import threading
+
+import rospy
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose, Point
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import SpawnModel, SpawnModelRequest
+from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
+from gazebo_msgs.srv import SetModelState, GetWorldProperties
+
+from uav_bushfire.msg import Hotspot, HotspotArray, FireClaim
+from uav_scout_bushfire.msg import Tank, WaterBoard
+
+
+# A fire, built to size and with no collision at all.
+#
+# No collision because the aircraft is meant to fly down into this, and a fire
+# that could be shouldered aside by a rotor would be a different thing
+# entirely.
+#
+# Why it is generated rather than a constant
+# ------------------------------------------
+# A fire's intensity is what it is worth *and* how big it is, and until this
+# was built the second half of that was invisible in Gazebo: every fire was
+# the same fixed model, and the only place size showed up was the RViz marker.
+# So the model is built per ignition, scaled by intensity - a 10 stands more
+# than twice as tall as a 1 and throws light much further. The value a drone
+# is weighing is now the thing you can see out of the window.
+#
+# Nothing here can be done by scaling a model that already exists.
+# gazebo_msgs/ModelState carries a pose and a twist and no scale at all, so a
+# fire that changes size has to be a new model - which is why this file's
+# old move-it-never-replace-it rule had to be revisited. See _extinguish().
+#
+# Why it looks the way it does
+# ----------------------------
+# Gazebo Classic has no particle emitter and no cone primitive, so a flame has
+# to be built out of boxes, cylinders and spheres. Three things do the work:
+#
+#   emissive     under Gazebo's default lighting an unlit orange cylinder
+#                reads as an orange cylinder. Emissive is what makes it read
+#                as something burning, and it is graded through each tongue -
+#                deep red at the base, orange in the body, near-white at the
+#                tip - because a flame's colour gradient is most of what the
+#                eye uses to recognise one.
+#   a real light a point light at the base is the single biggest cue, because
+#                it is the only one that affects anything else: the ground,
+#                the tree trunks and the underside of a drone hovering over
+#                the fire all get lit by it. Emissive geometry illuminates
+#                nothing. Its range scales with intensity too.
+#   asymmetry    three tongues of different heights at irregular bearings.
+#                A radially symmetric flame looks like a traffic cone, and -
+#                more to the point - it cannot flicker: the spotter animates
+#                these by yawing the model a few degrees at ~flicker_hz, and
+#                yaw does nothing at all to a shape that is the same from
+#                every side.
+#
+# The scorch disc sits 1 mm up rather than flat on the ground plane, because
+# coplanar faces z-fight and a flickering black disc under every fire looks
+# like a rendering fault rather than a burn scar.
+
+# The dam: standing water the tenders draw from, and the only inexhaustible
+# thing in the world.
+#
+# Visual only, plus a low kerb with collision so a scout that misjudges its
+# approach is stopped by something rather than driving through the pond. The
+# water surface sits 5 mm above the kerb top so the two do not z-fight, and it
+# is deliberately a flat disc rather than anything clever: the point of this
+# model is to be unmistakable from across the arena at a glance, because "why
+# is that scout driving to the corner" is the first question the scenario
+# raises for anyone watching it.
+_DAM_SDF = """\
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="bushfire_dam">
+    <static>true</static>
+    <link name="kerb">
+      <pose>0 0 0.06 0 0 0</pose>
+      <collision name="kerb_col">
+        <geometry><cylinder><radius>%(kerb).3f</radius><length>0.12</length></cylinder></geometry>
+      </collision>
+      <visual name="kerb_vis">
+        <geometry><cylinder><radius>%(kerb).3f</radius><length>0.12</length></cylinder></geometry>
+        <material>
+          <ambient>0.28 0.26 0.24 1</ambient>
+          <diffuse>0.42 0.39 0.35 1</diffuse>
+        </material>
+      </visual>
+    </link>
+    <link name="water">
+      <pose>0 0 0.125 0 0 0</pose>
+      <visual name="water_vis">
+        <geometry><cylinder><radius>%(water).3f</radius><length>0.01</length></cylinder></geometry>
+        <material>
+          <ambient>0.02 0.16 0.30 1</ambient>
+          <diffuse>0.05 0.32 0.62 1</diffuse>
+          <specular>0.4 0.5 0.6 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+
+_TONGUES = (  # bearing (rad), radial offset, height multiplier
+    (0.4, 0.06, 1.00),
+    (2.7, 0.11, 0.74),
+    (4.6, 0.09, 0.55),
+)
+
+
+def _sphere(name, x, y, z, radius, colour, emissive):
+    r, g, b = colour
+    er, eg, eb = emissive
+    return """\
+    <link name="%s">
+      <pose>%.4f %.4f %.4f 0 0 0</pose>
+      <visual name="%s_vis">
+        <geometry><sphere><radius>%.4f</radius></sphere></geometry>
+        <material>
+          <ambient>%.3f %.3f %.3f 1</ambient>
+          <diffuse>%.3f %.3f %.3f 1</diffuse>
+          <emissive>%.3f %.3f %.3f 1</emissive>
+        </material>
+      </visual>
+    </link>
+""" % (name, x, y, z, name, radius, r * 0.9, g * 0.9, b * 0.9, r, g, b,
+       er, eg, eb)
+
+
+def _flame_sdf(intensity, scale=1.0, light=True):
+    """The SDF for one fire, sized by its intensity.
+
+    `scale` is a whole-model multiplier for tuning the look; intensity is what
+    actually drives the size. The mapping is deliberately not linear in radius:
+    a fire twice as valuable should look considerably more than twice as
+    alarming, but a 10 also has to stay small enough that a crew of three can
+    stand on a 0.58 m ring around it without being buried in it. 0.62 to 1.35
+    over the 1-10 range keeps the tallest flame just under the height the
+    lowest crew member holds at.
+    """
+    s = scale * (0.62 + 0.081 * (max(1.0, min(10.0, intensity)) - 1.0))
+
+    parts = ["""\
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="bushfire_flame">
+    <static>true</static>
+    <link name="scorch">
+      <pose>0 0 0.001 0 0 0</pose>
+      <visual name="scorch_vis">
+        <geometry><cylinder><radius>%.4f</radius><length>0.002</length></cylinder></geometry>
+        <material>
+          <ambient>0.05 0.03 0.02 1</ambient>
+          <diffuse>0.10 0.06 0.04 1</diffuse>
+          <emissive>0.05 0.02 0.0 1</emissive>
+        </material>
+      </visual>
+    </link>
+    <link name="embers">
+      <pose>0 0 %.4f 0 0 0</pose>
+      <visual name="embers_vis">
+        <geometry><cylinder><radius>%.4f</radius><length>%.4f</length></cylinder></geometry>
+        <material>
+          <ambient>0.6 0.10 0.0 1</ambient>
+          <diffuse>0.8 0.15 0.0 1</diffuse>
+          <emissive>0.85 0.16 0.0 1</emissive>
+        </material>
+      </visual>
+    </link>
+""" % (0.62 * s, 0.045 * s, 0.34 * s, 0.09 * s)]
+
+    for i, (bearing, offset, tall) in enumerate(_TONGUES):
+        ox = offset * s * math.cos(bearing)
+        oy = offset * s * math.sin(bearing)
+        # Base, body, tip. Radii shrink and colour climbs together, which is
+        # what gives the tongue its taper without a cone primitive.
+        parts.append(_sphere('t%d_base' % i, ox, oy, 0.17 * s * tall,
+                             0.205 * s, (1.0, 0.22, 0.02), (0.95, 0.20, 0.0)))
+        parts.append(_sphere('t%d_body' % i, ox * 1.5, oy * 1.5, 0.40 * s * tall,
+                             0.150 * s, (1.0, 0.50, 0.04), (1.0, 0.48, 0.02)))
+        parts.append(_sphere('t%d_tip' % i, ox * 2.1, oy * 2.1, 0.58 * s * tall,
+                             0.088 * s, (1.0, 0.86, 0.42), (1.0, 0.82, 0.35)))
+
+    # Smoke. Translucent and unlit, and taller over a fiercer fire - from a
+    # distance the smoke column is what tells you where the big one is.
+    parts.append("""\
+    <link name="smoke">
+      <pose>%.4f %.4f %.4f 0 0 0</pose>
+      <visual name="smoke_vis">
+        <geometry><cylinder><radius>%.4f</radius><length>%.4f</length></cylinder></geometry>
+        <material>
+          <ambient>0.24 0.24 0.26 0.30</ambient>
+          <diffuse>0.34 0.34 0.37 0.30</diffuse>
+        </material>
+      </visual>
+    </link>
+""" % (0.05 * s, 0.03 * s, 0.95 * s + 0.55 * s * intensity * 0.1,
+       0.15 * s, 1.0 * s + 0.9 * s * intensity * 0.1))
+
+    if light:
+        # The one element that lights anything else. Range grows with the
+        # fire, so a 10 washes the trunks around it and a 1 barely marks the
+        # ground. cast_shadows off: five shadow-casting point lights in a
+        # stand of timber costs more frames than it is worth.
+        parts.append("""\
+    <link name="glow">
+      <pose>0 0 %.4f 0 0 0</pose>
+      <light name="fire_light" type="point">
+        <diffuse>1.0 0.52 0.14 1</diffuse>
+        <specular>0.25 0.10 0.02 1</specular>
+        <attenuation>
+          <range>%.3f</range>
+          <constant>0.28</constant>
+          <linear>0.42</linear>
+          <quadratic>0.12</quadratic>
+        </attenuation>
+        <cast_shadows>false</cast_shadows>
+      </light>
+    </link>
+""" % (0.30 * s, 1.6 + 0.34 * intensity))
+
+    parts.append('  </model>\n</sdf>')
+    return ''.join(parts)
+
+
+class _Fire(object):
+    """One slot in the pool. Burning, or out and waiting to re-ignite.
+
+    `model_name` is None while the slot is out, and carries a fresh sequence
+    number on every ignition. Both facts matter - see _extinguish().
+    """
+
+    def __init__(self, fire_id):
+        self.id = fire_id
+        self.seq = 0
+        self.model_name = None
+        self.x = 0.0
+        self.y = 0.0
+        self.intensity = 1.0
+        self.work_total = 1.0
+        self.work_done = 0.0
+        self.burning = False
+        self.relight_at = rospy.Time(0)
+        self.ignited_at = rospy.Time(0)
+
+    def work_left(self):
+        return max(0.0, self.work_total - self.work_done)
+
+    def to_msg(self, crew=0, station=None, suppressed=False, reward=0.0):
+        h = Hotspot()
+        h.id = self.id
+        h.x = self.x
+        h.y = self.y
+        h.intensity = self.intensity
+        h.work_total = self.work_total
+        h.work_done = self.work_done
+        h.crew = crew
+        h.share = self.intensity / float(max(crew, 1))
+        sx, sy, sz = station if station is not None else (self.x, self.y, 0.0)
+        h.station_x = sx
+        h.station_y = sy
+        h.station_z = sz
+        h.suppressed = suppressed
+        h.reward = reward
+        return h
+
+
+class IncidentController(object):
+
+    def __init__(self):
+        rospy.init_node('incident_controller', anonymous=False)
+
+        self._drones       = rospy.get_param('~drones', [])
+        self._tenders      = rospy.get_param('~tenders', [])
+        self._tank_cap     = rospy.get_param('~tank_capacity', 40.0)
+        self._tender_cap   = rospy.get_param('~tender_capacity', 240.0)
+        self._flow         = rospy.get_param('~flow_rate', 4.0)
+        self._refill_rate  = rospy.get_param('~refill_rate', 20.0)
+        self._dam_rate     = rospy.get_param('~dam_rate', 60.0)
+        self._refill_rad   = rospy.get_param('~refill_radius', 0.90)
+        self._refill_alt   = rospy.get_param('~refill_altitude', 1.30)
+        self._refill_min   = rospy.get_param('~refill_min_altitude', 0.45)
+        self._still        = rospy.get_param('~tender_still', 0.08)
+        self._dam_x        = rospy.get_param('~dam_x', 5.0)
+        self._dam_y        = rospy.get_param('~dam_y', 5.0)
+        self._dam_rad      = rospy.get_param('~dam_radius', 1.60)
+        self._serve_rad    = rospy.get_param('~serve_radius', 2.60)
+        self._serve_to     = rospy.get_param('~serve_timeout', 25.0)
+        self._n            = int(rospy.get_param('~num_hotspots', 5))
+        self._half         = rospy.get_param('~world_half_size', 4.0)
+        self._cdist        = rospy.get_param('~collect_dist', 1.00)
+        self._suppress_alt = rospy.get_param('~suppress_altitude', 1.45)
+        self._min_drop_alt = rospy.get_param('~min_drop_altitude', 0.45)
+        self._work_per     = rospy.get_param('~work_per_intensity', 1.2)
+        self._max_crew     = int(rospy.get_param('~max_crew', 3))
+        self._join_dl      = rospy.get_param('~join_deadline', 0.7)
+        self._crew_sep     = rospy.get_param('~crew_separation', 1.00)
+        self._max_ring     = rospy.get_param('~max_ring', 0.75)
+        self._drop_alt     = rospy.get_param('~drop_altitude', 0.95)
+        self._alt_step     = rospy.get_param('~crew_altitude_step', 0.15)
+        # Longer than uav_bushfire's 90 s, and the refill trip is why: a
+        # committed drone that runs dry has to fly to a tender, wait for it to
+        # stop if it is moving, fill, and fly back. That is legitimately off
+        # station for a while, and timing it out would take a fire off a drone
+        # for doing exactly what the scenario requires of it.
+        self._commit_to    = rospy.get_param('~commit_timeout', 120.0)
+        self._min_sep      = rospy.get_param('~min_separation', 2.5)
+        self._pause        = rospy.get_param('~extinguish_pause', 1.5)
+        self._flame_scale  = rospy.get_param('~flame_scale', 1.0)
+        self._fire_light   = rospy.get_param('~fire_light', True)
+        self._flicker_hz   = rospy.get_param('~flicker_hz', 4.0)
+        pub_hz             = rospy.get_param('~publish_hz', 10.0)
+        self._reignite     = rospy.get_param('~reignite_period', 120.0)
+        self._obstacles    = rospy.get_param('~obstacles', [])
+        self._clearance    = rospy.get_param('~obstacle_clearance', 0.8)
+
+        if not self._drones:
+            rospy.logwarn('[INCIDENT] ~drones is empty - no claims will be taken')
+        if not self._tenders:
+            rospy.logwarn('[INCIDENT] ~tenders is empty - nothing will refill '
+                          'the drones, so the fleet gets one tank each and '
+                          'then holds station over fires it cannot put out')
+
+        # One tank of water burns this many seconds of bombing, and a fire of
+        # this size needs more than that. Worth saying out loud at startup,
+        # because it is the number that decides whether the scenario is a
+        # cooperation or three drones that never need anybody.
+        seconds = self._tank_cap / max(self._flow, 1e-6)
+        solo = seconds / max(self._work_per, 1e-6)
+        rospy.loginfo('[INCIDENT] one tank = %.1f s of bombing = a fire of '
+                      'about %.1f; anything bigger needs a refill or a crew',
+                      seconds, solo)
+
+        # The tallest crew station has to stay under the ceiling, or the last
+        # member of a full crew hovers above the band and contributes nothing
+        # while believing it is working. Cheap to check once, invisible if it
+        # is wrong.
+        top = self._drop_alt + self._alt_step * (self._max_crew - 1)
+        if top > self._suppress_alt:
+            rospy.logwarn('[INCIDENT] crew of %d tops out at %.2f m, above '
+                          'suppress_altitude %.2f - the top station cannot '
+                          'bomb; lower ~crew_altitude_step or raise the ceiling',
+                          self._max_crew, top, self._suppress_alt)
+        ring = (self._crew_sep / (2.0 * math.sin(math.pi / self._max_crew))
+                if self._max_crew > 1 else 0.0)
+        if min(ring, self._max_ring) > self._cdist:
+            rospy.logwarn('[INCIDENT] crew ring of %.2f m falls outside '
+                          'collect_dist %.2f - crew members would be off '
+                          'station by construction', ring, self._cdist)
+
+        # Per-drone state, all keyed by namespace, so a drone that never
+        # publishes odometry simply never gets paid rather than holding up the
+        # others.
+        self._pose = {}
+        self._have_pose = {}
+        self._speed = {}
+        self._score = {}
+        self._drops = {}
+        self._committed = {}
+        self._commit_at = {}
+        self._working_at = {}
+        self._target_pub = {}
+
+        for ns in self._drones:
+            self._pose[ns] = (0.0, 0.0, 0.0)
+            self._have_pose[ns] = False
+            self._score[ns] = 0.0
+            self._drops[ns] = 0
+            self._committed[ns] = None
+            self._commit_at[ns] = rospy.Time(0)
+            self._working_at[ns] = rospy.Time(0)
+            self._target_pub[ns] = rospy.Publisher(
+                '/%s/bushfire/target' % ns, Hotspot, queue_size=10)
+            rospy.Subscriber('/%s/ground_truth/state' % ns, Odometry,
+                             self._odom_cb, callback_args=ns)
+
+        # The water ledger. Drones and tenders keyed the same way, because a
+        # transfer between them is symmetric bookkeeping - one side goes down
+        # by exactly what the other goes up by, and that is much easier to keep
+        # true when both live in the same dict.
+        self._litres = {}
+        self._delivered = {}       # tenders: litres handed to drones
+        self._served = {}          # tenders: refills completed
+        self._dam_trips = {}
+        self._still_since = {}     # tenders: when it last started standing
+        self._serving = {}         # tender -> the one drone allowed to descend
+        self._serve_at = {}        # tender -> when that slot was granted
+
+        for ns in self._drones:
+            self._litres[ns] = self._tank_cap
+
+        for ns in self._tenders:
+            self._pose[ns] = (0.0, 0.0, 0.0)
+            self._have_pose[ns] = False
+            self._litres[ns] = self._tender_cap
+            self._delivered[ns] = 0.0
+            self._served[ns] = 0
+            self._dam_trips[ns] = 0
+            self._speed[ns] = 0.0
+            self._serving[ns] = None
+            self._serve_at[ns] = rospy.Time(0)
+            rospy.Subscriber('/%s/odom' % ns, Odometry,
+                             self._tender_odom_cb, callback_args=ns)
+
+        self._water_pub = rospy.Publisher(
+            '/bushfire/water', WaterBoard, queue_size=5)
+
+        # fire id -> list of namespaces, in join order. A list rather than a
+        # set because the index *is* the station: member 0 keeps its slot on
+        # the ring when member 2 leaves, so nobody is shuffled sideways at low
+        # level by somebody else's arrival.
+        self._crew = {}
+        self._crew_lock = threading.Lock()
+
+        self._hotspot_pub = rospy.Publisher(
+            '/bushfire/hotspots', HotspotArray, queue_size=5)
+        self._marker_pub = rospy.Publisher(
+            '/bushfire/markers', MarkerArray, queue_size=5, latch=True)
+
+        # Serialises the moves, which run on their own threads so a Gazebo
+        # service call can never stall the publish timer.
+        self._model_lock = threading.Lock()
+
+        rospy.loginfo('[INCIDENT] waiting for Gazebo model services...')
+        rospy.wait_for_service('/gazebo/spawn_sdf_model', timeout=60.0)
+        rospy.wait_for_service('/gazebo/delete_model', timeout=60.0)
+        rospy.wait_for_service('/gazebo/set_model_state', timeout=60.0)
+        rospy.wait_for_service('/gazebo/get_world_properties', timeout=60.0)
+        self._spawn_srv  = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+        self._delete_srv = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)
+        self._move_srv   = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+        self._world_srv  = rospy.ServiceProxy('/gazebo/get_world_properties',
+                                              GetWorldProperties)
+
+        self._purge_stale_models()
+        self._spawn_dam()
+        self._fires = [_Fire(i) for i in range(self._n)]
+        for fire in self._fires:
+            self._crew[fire.id] = []
+            self._ignite(fire, first=True)
+
+        self._publish_markers()
+
+        # Subscribed last, so no claim arrives before the fire ground exists.
+        rospy.Subscriber('/bushfire/claims', FireClaim, self._claim_cb)
+
+        rospy.loginfo(
+            '[INCIDENT] fire ground ready | %d fires | +-%.1f m | bomb within '
+            '%.2f m and %.2f-%.2f m | %.1f drone-s per point | crews up to %d '
+            '| fleet %s',
+            self._n, self._half, self._cdist, self._min_drop_alt,
+            self._suppress_alt, self._work_per, self._max_crew,
+            ', '.join(self._drones) if self._drones else '(nobody)')
+        for fire in self._fires:
+            rospy.loginfo('[INCIDENT] fire %d burning at (%.2f, %.2f) worth %.0f, '
+                          '%.1f drone-s of work',
+                          fire.id, fire.x, fire.y, fire.intensity, fire.work_total)
+
+        self._last_tick = rospy.Time(0)
+        rospy.Timer(rospy.Duration(1.0 / pub_hz), self._tick)
+        if self._flicker_hz > 0.0:
+            rospy.Timer(rospy.Duration(1.0 / self._flicker_hz),
+                        self._flicker_loop)
+
+    # ------------------------------------------------------- Gazebo models --
+    def _purge_stale_models(self):
+        """Delete every flame left behind by a previous run.
+
+        By prefix rather than by name, because the names carry an ignition
+        sequence now and a crashed run leaves behind whichever numbers it had
+        reached. Asked about first rather than deleted blind: Gazebo logs an
+        ERROR for the delete of a model that is not there, and a screenful of
+        those at every startup is indistinguishable at a glance from the ones
+        that mean something.
+        """
+        try:
+            names = [n for n in self._world_srv().model_names
+                     if n.startswith('bushfire_flame') or n == 'bushfire_dam']
+        except Exception:
+            return
+        for name in names:
+            req = DeleteModelRequest()
+            req.model_name = name
+            try:
+                self._delete_srv(req)
+            except Exception:
+                pass
+        if names:
+            rospy.loginfo('[INCIDENT] cleared %d flame(s) from a previous run',
+                          len(names))
+
+    def _spawn_dam(self):
+        """Put the dam in the world, once.
+
+        Spawned rather than written into the world file so that ~dam_x/~dam_y
+        stay the single authority on where the water is - the tenders drive to
+        the number on the water board, and a model that disagreed with it would
+        be a scout parked politely beside a pond it cannot draw from.
+        """
+        req = SpawnModelRequest()
+        req.model_name = 'bushfire_dam'
+        req.model_xml = _DAM_SDF % {'kerb': self._dam_rad * 0.62,
+                                    'water': self._dam_rad * 0.56}
+        req.reference_frame = 'world'
+        req.initial_pose = Pose()
+        req.initial_pose.position.x = self._dam_x
+        req.initial_pose.position.y = self._dam_y
+        req.initial_pose.orientation.w = 1.0
+        try:
+            resp = self._spawn_srv(req)
+            if resp.success:
+                rospy.loginfo('[INCIDENT] dam at (%.1f, %.1f), draw radius '
+                              '%.1f m', self._dam_x, self._dam_y, self._dam_rad)
+            else:
+                rospy.logwarn('[INCIDENT] dam spawn failed: %s',
+                              resp.status_message)
+        except Exception as exc:
+            rospy.logwarn('[INCIDENT] dam spawn error: %s', exc)
+
+    def _spawn_flame(self, fire):
+        """Put this fire's model into the world, built to its intensity.
+
+        The name carries an ignition sequence, so no name is ever spawned
+        twice in a run - see _extinguish() for why that is the whole trick.
+        """
+        fire.seq += 1
+        name = 'bushfire_flame_%d_%d' % (fire.id, fire.seq)
+
+        pose = Pose()
+        pose.position.x = fire.x
+        pose.position.y = fire.y
+        pose.position.z = 0.0
+        pose.orientation.w = 1.0
+
+        req = SpawnModelRequest()
+        req.model_name      = name
+        req.model_xml       = _flame_sdf(fire.intensity, self._flame_scale,
+                                         self._fire_light)
+        req.reference_frame = 'world'
+        req.initial_pose    = pose
+        try:
+            resp = self._spawn_srv(req)
+            if resp.success:
+                fire.model_name = name
+            else:
+                rospy.logwarn('[INCIDENT] spawn of %s failed: %s',
+                              name, resp.status_message)
+        except Exception as exc:
+            rospy.logwarn('[INCIDENT] spawn service error: %s', exc)
+
+    def _despawn_flame(self, name):
+        """Take a flame out of the world. This is what "the fire went out"
+        looks like from the viewer's side."""
+        req = DeleteModelRequest()
+        req.model_name = name
+        try:
+            resp = self._delete_srv(req)
+            if not resp.success:
+                rospy.logwarn('[INCIDENT] delete of %s failed: %s',
+                              name, resp.status_message)
+        except Exception as exc:
+            rospy.logwarn('[INCIDENT] delete service error: %s', exc)
+
+    def _flicker(self, fire, yaw):
+        """Yaw the flame a few degrees. Cheap animation, no respawn.
+
+        set_model_state is still the right tool for this and only this: it has
+        no insert/remove race to lose, it works on a <static> model, and moving
+        a model that is already there is all a flicker is. It is also why the
+        tongues are at irregular bearings - yawing a radially symmetric flame
+        does nothing at all.
+        """
+        state = ModelState()
+        state.model_name = fire.model_name
+        state.reference_frame = 'world'
+        state.pose.position.x = fire.x
+        state.pose.position.y = fire.y
+        state.pose.position.z = 0.0
+        state.pose.orientation.z = math.sin(0.5 * yaw)
+        state.pose.orientation.w = math.cos(0.5 * yaw)
+        try:
+            self._move_srv(state)
+        except Exception:
+            pass
+
+    def _flicker_loop(self, _event):
+        if self._flicker_hz <= 0.0:
+            return
+        with self._model_lock:
+            for fire in self._fires:
+                if fire.burning and fire.model_name:
+                    self._flicker(fire, random.uniform(-0.35, 0.35))
+
+    # ------------------------------------------------------------ placement --
+    def _clear_of_obstacles(self, x, y):
+        for obs in self._obstacles:
+            ox, oy, radius = obs[0], obs[1], obs[2]
+            if math.hypot(x - ox, y - oy) < radius + self._clearance:
+                return False
+        return True
+
+    def _clear_of_fires(self, x, y, ignore_id):
+        for other in self._fires:
+            if other.id == ignore_id or not other.burning:
+                # A slot that is out is about to be lit somewhere else, so
+                # where it used to burn says nothing about where this one may.
+                continue
+            if math.hypot(x - other.x, y - other.y) < self._min_sep:
+                return False
+        return True
+
+    # -------------------------------------------------------- the lifecycle --
+    def _extinguish(self, fire):
+        """Put the fire out: it leaves the world, and the board, for a moment.
+
+        This is the half of "suppressed" that used to be invisible. The slot
+        was moved straight to its next position, so from the viewer's side a
+        fire never went out - one blinked from under three drones to somewhere
+        across the arena, which reads as a fire that moved rather than a fire
+        that was beaten.
+
+        It is also what makes a per-intensity model possible at all.
+        gazebo_msgs/ModelState carries a pose and a twist and *no scale*, so a
+        fire that is a different size has to be a different model, and this
+        node's old rule was that a flame is moved and never replaced. That rule
+        existed for a real reason - delete-then-spawn races itself, because
+        Gazebo answers both calls immediately and defers the work to a world
+        update, so a delete can arrive before the insertion it is chasing and
+        be told "model does not exist" while the insertion goes ahead anyway.
+        Measured in the treasure version: 33 failed deletes in four and a half
+        minutes and a target with no model in the world at all.
+
+        Two things remove that race rather than tolerate it. The name carries
+        an ignition sequence, so no name is ever spawned twice and a delete can
+        never be confused about which insertion it refers to; and the pause
+        between them is ~extinguish_pause, not zero, so the delete has a second
+        of world updates to itself before anything is spawned. What is left is
+        a delete of a model that has been standing for at least the time it
+        took a drone to fly over and bomb it.
+        """
+        fire.burning = False
+        fire.work_done = fire.work_total
+        fire.relight_at = rospy.Time.now() + rospy.Duration(self._pause)
+        name, fire.model_name = fire.model_name, None
+        if name:
+            threading.Thread(target=self._despawn_locked, args=(name,),
+                             daemon=True).start()
+
+    def _despawn_locked(self, name):
+        with self._model_lock:
+            self._despawn_flame(name)
+
+    def _spawn_locked(self, fire):
+        with self._model_lock:
+            self._spawn_flame(fire)
+
+    def _ignite(self, fire, first=False):
+        """Light this slot somewhere clear, and roll its value.
+
+        Rejection sampling, capped. Fires are kept ~min_separation apart as
+        well as clear of the trees, and the separation has to clear two *crews*
+        now rather than two drones: a full crew occupies a ring of up to
+        ~max_ring plus a rotor span, so fires closer together than that would
+        have their crews flying through each other.
+        """
+        for _ in range(200):
+            x = random.uniform(-self._half, self._half)
+            y = random.uniform(-self._half, self._half)
+            if (self._clear_of_obstacles(x, y) and
+                    self._clear_of_fires(x, y, fire.id)):
+                break
+        else:
+            rospy.logwarn('[INCIDENT] no clear ground for fire %d in 200 tries; '
+                          'check ~obstacles, ~min_separation, ~world_half_size',
+                          fire.id)
+        fire.x = x
+        fire.y = y
+        fire.intensity = float(random.randint(1, 10))
+        # The two lines that make a big fire big rather than merely valuable:
+        # this one in the mechanics, and the model _spawn_flame builds from the
+        # same number in the world.
+        fire.work_total = max(0.1, fire.intensity * self._work_per)
+        fire.work_done = 0.0
+        fire.burning = True
+        fire.ignited_at = rospy.Time.now()
+        # The first round is spawned inline so the fire ground is complete
+        # before anything is published; after that it goes on a thread, because
+        # a Gazebo service call must never stall the tick that is metering
+        # everybody else's work.
+        if first:
+            self._spawn_flame(fire)
+        else:
+            threading.Thread(target=self._spawn_locked, args=(fire,),
+                             daemon=True).start()
+
+    # ------------------------------------------------------------- stations --
+    def _station(self, fire, index, crew_size):
+        """Where crew member `index` of `crew_size` holds while bombing.
+
+        A lone drone gets the fire itself. A crew is spread over a ring whose
+        radius is set by the separation wanted between neighbours - the chord
+        of a regular n-gon, r = sep / (2 sin(pi/n)) - and stacked in altitude
+        on top of that, because a ring alone puts two aircraft at the same
+        height with a tree's worth of gap and rotor wash to share.
+
+        The ring is phased by fire id so that two nearby fires do not lay their
+        crews out along the same bearing and put two stations next to each
+        other.
+        """
+        if crew_size <= 1:
+            return (fire.x, fire.y, self._drop_alt)
+        radius = min(self._crew_sep / (2.0 * math.sin(math.pi / crew_size)),
+                     self._max_ring)
+        theta = 0.7 * fire.id + 2.0 * math.pi * index / float(crew_size)
+        return (fire.x + radius * math.cos(theta),
+                fire.y + radius * math.sin(theta),
+                self._drop_alt + self._alt_step * index)
+
+    # -------------------------------------------------------------- markers --
+    def _publish_markers(self):
+        """One MarkerArray for the whole fire ground, in the world frame.
+
+        World rather than any drone's odom frame: every aircraft shares it, so
+        one RViz shows the whole incident without a transform between the
+        namespaces.
+        """
+        arr = MarkerArray()
+        now = rospy.Time.now()
+
+        for fire in self._fires:
+            crew = len(self._crew.get(fire.id, ()))
+            done = (fire.work_done / fire.work_total
+                    if fire.work_total > 0.0 else 0.0)
+
+            if not fire.burning:
+                # Out. Take both markers down rather than leaving a ghost
+                # flame in RViz over ground where nothing is burning - the
+                # Gazebo model has gone, and the two views should agree.
+                for ns in ('fire', 'fire_label'):
+                    gone = Marker()
+                    gone.header.frame_id = 'world'
+                    gone.header.stamp = now
+                    gone.ns = ns
+                    gone.id = fire.id
+                    gone.action = Marker.DELETE
+                    arr.markers.append(gone)
+                continue
+
+            flame = Marker()
+            flame.header.frame_id = 'world'
+            flame.header.stamp = now
+            flame.ns = 'fire'
+            flame.id = fire.id
+            flame.type = Marker.CYLINDER
+            flame.action = Marker.ADD
+            flame.pose.position = Point(fire.x, fire.y, 0.3)
+            flame.pose.orientation.w = 1.0
+            # Fierce fires are visibly bigger here. The Gazebo model is one
+            # fixed size, because it is moved rather than respawned and scaling
+            # it would mean going back to respawning; a marker is free to
+            # scale, so this is where intensity gets shown. Height shrinks as
+            # the work is done, so a fire being bombed is visibly going out.
+            width = 0.35 + 0.05 * fire.intensity
+            flame.scale.x = flame.scale.y = width
+            flame.scale.z = 0.6 * max(0.15, 1.0 - done)
+            flame.color = ColorRGBA(1.0, 0.30 + 0.03 * fire.intensity, 0.0, 0.85)
+            flame.lifetime = rospy.Duration(0)
+            arr.markers.append(flame)
+
+            txt = Marker()
+            txt.header.frame_id = 'world'
+            txt.header.stamp = now
+            txt.ns = 'fire_label'
+            txt.id = fire.id
+            txt.type = Marker.TEXT_VIEW_FACING
+            txt.action = Marker.ADD
+            txt.pose.position = Point(fire.x, fire.y, 1.15)
+            txt.pose.orientation.w = 1.0
+            txt.scale.z = 0.28
+            txt.color = ColorRGBA(1.0, 0.85, 0.4, 1.0)
+            # Value first, then the deal on it: who is on it and what each of
+            # them will get. A bare intensity was enough when a fire was worth
+            # the same to whoever reached it first.
+            if crew:
+                txt.text = '%d  x%d @%.1f  %d%%' % (
+                    int(fire.intensity), crew,
+                    fire.intensity / float(crew), int(100.0 * done))
+            else:
+                txt.text = '%d' % int(fire.intensity)
+            txt.lifetime = rospy.Duration(0)
+            arr.markers.append(txt)
+
+        self._marker_pub.publish(arr)
+
+    # ------------------------------------------------------------ callbacks --
+    def _odom_cb(self, msg, ns):
+        p = msg.pose.pose.position
+        self._pose[ns] = (p.x, p.y, p.z)
+        self._have_pose[ns] = True
+
+    def _tender_odom_cb(self, msg, ns):
+        """A scout's pose and, just as important, whether it is moving.
+
+        The speed is read here rather than reported by the scout, because what
+        it gates is a drone descending to hover over this vehicle. A tender
+        that says it is stopped and is not would be an aircraft coming down
+        onto a moving target, so the claim is checked against the same
+        odometry everything else in this node is judged by.
+        """
+        p = msg.pose.pose.position
+        v = msg.twist.twist.linear
+        self._pose[ns] = (p.x, p.y, p.z)
+        self._speed[ns] = math.hypot(v.x, v.y)
+        self._have_pose[ns] = True
+
+    # --------------------------------------------------------------- water --
+    def _tender_ready(self, ns):
+        """Stopped, and with something to give."""
+        return (self._have_pose[ns] and
+                self._speed.get(ns, 0.0) <= self._still and
+                self._litres[ns] > 0.05)
+
+    def _transfer_water(self, dt, now):
+        """Meter the two transfers that vehicles have to arrange between them.
+
+        Bombing is metered with the work, in _tick, because it *is* the work.
+        These two are the ones that need a rendezvous.
+
+        Both are deliberately written as "take the smallest of what the giver
+        has, what the taker can hold, and what the rate allows in dt", so no
+        amount of clock jitter can create or destroy water. Litres are the one
+        quantity in this package that two nodes both believe in, and an
+        accounting slip in either direction is invisible until the numbers stop
+        making sense an hour into a run.
+        """
+        # ---- tender <- dam ------------------------------------------------
+        for ns in self._tenders:
+            if not self._have_pose[ns]:
+                continue
+            x, y, _ = self._pose[ns]
+            if math.hypot(x - self._dam_x, y - self._dam_y) > self._dam_rad:
+                continue
+            room = self._tender_cap - self._litres[ns]
+            if room <= 0.01:
+                continue
+            was_empty = self._litres[ns] < 0.05
+            self._litres[ns] = min(self._tender_cap,
+                                   self._litres[ns] + self._dam_rate * dt)
+            if was_empty:
+                self._dam_trips[ns] += 1
+                rospy.loginfo('[INCIDENT] %s is drawing at the dam (trip #%d)',
+                              ns, self._dam_trips[ns])
+
+        # ---- drone <- tender ----------------------------------------------
+        # One drone at a time, per tender. This is a queue rather than a free
+        # for all, and the reason is collisions rather than plumbing: a tender
+        # is a single point, so every drone that wanted water flew to that
+        # point and station-kept on it. Measured on the first run with two
+        # aircraft queueing - 0.20 m apart, one climbing away full while the
+        # next descended into the same column, with rotor tips 0.396 m out.
+        #
+        # So the tender nominates one drone, everybody else holds off at their
+        # own bearing (see _hold_point in fire_suppressor), and the nomination
+        # is published on the water board so they all know whose turn it is.
+        self._pick_served(now)
+
+        for tns in self._tenders:
+            ns = self._serving.get(tns)
+            if ns is None:
+                continue
+            room = self._tank_cap - self._litres[ns]
+            dx, dy, dz = self._pose[ns]
+            if room <= 0.01 or not (self._refill_min <= dz <= self._refill_alt):
+                # Nominated but not in position yet - it is still on its way
+                # down. Hold the slot for it rather than giving it away.
+                continue
+            tx, ty, _ = self._pose[tns]
+            if math.hypot(dx - tx, dy - ty) > self._refill_rad:
+                continue
+
+            took = min(self._refill_rate * dt, room, self._litres[tns])
+            if took <= 0.0:
+                continue
+            was_dry = self._litres[ns] < 0.05
+            self._litres[ns] += took
+            self._litres[tns] -= took
+            self._delivered[tns] += took
+            if was_dry:
+                self._served[tns] += 1
+                rospy.loginfo('[INCIDENT] %s is taking water from %s '
+                              '(%s has %.0f L left, %d refills given)',
+                              ns, tns, tns, self._litres[tns],
+                              self._served[tns])
+
+    def _pick_served(self, now):
+        """Decide which drone each tender is currently serving.
+
+        Sticky: a drone keeps the slot until it is full, leaves the area, or
+        runs out the safety timeout. Sticky matters more than picking well -
+        a nomination that changed every tick would have two aircraft alternately
+        descending and climbing in the same column, which is the failure this
+        whole mechanism exists to remove.
+
+        Candidacy is horizontal proximity within ~serve_radius, *not* being in
+        the refill altitude band. It has to be: a drone only enters the band by
+        descending, and it only descends once nominated, so judging candidacy
+        by the band would mean nobody was ever nominated and no drone ever
+        refuelled.
+        """
+        for tns in self._tenders:
+            if not self._have_pose[tns]:
+                self._serving[tns] = None
+                continue
+            tx, ty, _ = self._pose[tns]
+
+            cur = self._serving.get(tns)
+            if cur is not None:
+                dx, dy, _ = self._pose[cur]
+                near = math.hypot(dx - tx, dy - ty) <= self._serve_rad
+                full = self._litres[cur] >= self._tank_cap - 0.01
+                stale = (now - self._serve_at[tns]).to_sec() > self._serve_to
+                if near and not full and not stale:
+                    continue
+                if stale:
+                    rospy.logwarn('[INCIDENT] %s held %s\'s slot for %.0f s '
+                                  'without filling - giving it up',
+                                  cur, tns, self._serve_to)
+                self._serving[tns] = None
+
+            if not self._tender_ready(tns):
+                continue
+
+            best, best_d = None, self._serve_rad
+            for ns in self._drones:
+                if not self._have_pose[ns]:
+                    continue
+                if self._litres[ns] >= self._tank_cap - 0.01:
+                    continue
+                dx, dy, _ = self._pose[ns]
+                d = math.hypot(dx - tx, dy - ty)
+                if d <= best_d:
+                    best, best_d = ns, d
+            if best is not None:
+                self._serving[tns] = best
+                self._serve_at[tns] = now
+
+    def _water_board(self, stamp):
+        board = WaterBoard()
+        board.header.stamp = stamp
+        board.header.frame_id = 'world'
+        board.dam_x = self._dam_x
+        board.dam_y = self._dam_y
+        board.dam_radius = self._dam_rad
+
+        for ns in self._drones:
+            t = Tank()
+            t.vehicle = ns
+            t.tender = False
+            t.litres = self._litres[ns]
+            t.capacity = self._tank_cap
+            t.x, t.y, _ = self._pose[ns]
+            t.ready = False
+            board.tanks.append(t)
+
+        for ns in self._tenders:
+            t = Tank()
+            t.vehicle = ns
+            t.tender = True
+            t.litres = self._litres[ns]
+            t.capacity = self._tender_cap
+            t.x, t.y, _ = self._pose[ns]
+            t.ready = self._tender_ready(ns)
+            t.serving = self._serving.get(ns) or ''
+            board.tanks.append(t)
+
+        return board
+
+    def _claim_cb(self, msg):
+        """A drone announcing what it has chosen. The ledger's only input.
+
+        Everything here is a rejection rule, and each one is load-bearing:
+
+          unknown drone   nothing else in the run would notice, and a typo in
+                          ~drones would otherwise show up as one aircraft that
+                          silently never scores.
+          already holding a fire   the commitment rule. Ignored rather than
+                          answered, because the drone is already being sent
+                          its real assignment ten times a second and that is
+                          the answer.
+          crew is full    the ring only has so many stations.
+          crew is closed  the fire is more than ~join_deadline of the way out.
+                          Equal shares plus shared labour has one degenerate
+                          corner and this is it: `work_left / n` collapses as a
+                          job finishes, so a fire at 95% is the best-looking
+                          thing on the board and joining it pays a full share
+                          for turning up after it is over. Measured on the
+                          first run: a drone bombed a 7 alone for fourteen
+                          seconds and was joined at 0.3 drone-seconds
+                          remaining by both others, keeping 2.33 of it. The
+                          deadline only applies to a fire that already has a
+                          crew - taking over an abandoned job at 90% is fine,
+                          because there is nobody to take it from.
+
+        A refused claimant is not told. It keeps claiming until something is
+        accepted and re-picks on its own timeout, which is the same code path
+        as a lost message.
+        """
+        ns = msg.drone
+        if ns not in self._committed:
+            rospy.logwarn_throttle(10.0, '[INCIDENT] claim from unknown drone %r '
+                                   '- is it in ~drones?', ns)
+            return
+
+        with self._crew_lock:
+            held = self._committed[ns]
+
+            if msg.release:
+                if held is None:
+                    return
+                self._release(ns, held, 'released by the aircraft')
+                return
+
+            if held is not None:
+                if held != msg.fire_id:
+                    rospy.loginfo_throttle(
+                        5.0, '[INCIDENT] %s wants fire %d but still owes fire '
+                        '%d - claim ignored', ns, msg.fire_id, held)
+                return
+
+            fire = self._fire_by_id(msg.fire_id)
+            if fire is None:
+                return
+            if not fire.burning:
+                # It went out between the board being published and this claim
+                # arriving. The slot is not on the board while it is out, so
+                # the drone will pick again from the next one.
+                return
+            crew = self._crew[fire.id]
+            if len(crew) >= self._max_crew:
+                rospy.loginfo_throttle(
+                    5.0, '[INCIDENT] %s claimed fire %d but its crew is full '
+                    '(%d)', ns, fire.id, self._max_crew)
+                return
+            if (crew and fire.work_total > 0.0 and
+                    fire.work_done / fire.work_total > self._join_dl):
+                rospy.loginfo_throttle(
+                    5.0, '[INCIDENT] %s claimed fire %d but it is %.0f%% out - '
+                    'the crew is closed', ns, fire.id,
+                    100.0 * fire.work_done / fire.work_total)
+                return
+
+            crew.append(ns)
+            self._committed[ns] = fire.id
+            self._commit_at[ns] = rospy.Time.now()
+            self._working_at[ns] = rospy.Time(0)
+            rospy.loginfo('[INCIDENT] %s joins fire %d (worth %.0f, %.1f drone-s '
+                          'left) - crew of %d, %.2f each',
+                          ns, fire.id, fire.intensity, fire.work_left(),
+                          len(crew), fire.intensity / float(len(crew)))
+
+    # ------------------------------------------------------------- registry --
+    def _release(self, ns, fire_id, why):
+        """Drop one drone out of one crew. Caller holds _crew_lock."""
+        crew = self._crew.get(fire_id)
+        if crew and ns in crew:
+            crew.remove(ns)
+        self._committed[ns] = None
+        rospy.loginfo('[INCIDENT] %s off fire %d - %s (crew now %d)',
+                      ns, fire_id, why, len(self._crew.get(fire_id, ())))
+
+    def _fire_by_id(self, fire_id):
+        for fire in self._fires:
+            if fire.id == fire_id:
+                return fire
+        return None
+
+    def _on_station(self, ns, fire):
+        """Is this drone actually bombing this fire right now?
+
+        Measured against the *fire*, not the drone's ring station, and that is
+        deliberate: a crew member holding a slightly sloppy station is still
+        over the fire and still working, and making the test the station would
+        mean the geometry this node invented for collision reasons could also
+        silently stop the work.
+        """
+        if not self._have_pose[ns]:
+            return False
+        dx, dy, dz = self._pose[ns]
+        return (math.hypot(fire.x - dx, fire.y - dy) <= self._cdist and
+                self._min_drop_alt <= dz <= self._suppress_alt)
+
+    # ----------------------------------------------------------------- tick --
+    def _tick(self, _event):
+        now = rospy.Time.now()
+        dt = 0.0 if self._last_tick == rospy.Time(0) else (now - self._last_tick).to_sec()
+        self._last_tick = now
+        # A stalled simulator or a paused physics step must not hand a fire a
+        # second of free work, and sim time can go backwards on a reset.
+        dt = max(0.0, min(dt, 1.0))
+
+        moved = False
+        outbox = []
+
+        # Outside the crew lock: the transfers touch tanks and poses, neither
+        # of which the claim path looks at.
+        self._transfer_water(dt, now)
+
+        with self._crew_lock:
+            # -------- slots that are out come back -----------------------
+            # A suppressed fire leaves the world and the board for
+            # ~extinguish_pause, then this slot lights somewhere else. The gap
+            # is what makes a drop look like a drop rather than a fire
+            # teleporting across the arena, and it is also the window that
+            # makes deleting and respawning the model safe - see _extinguish().
+            for fire in self._fires:
+                if not fire.burning and now >= fire.relight_at:
+                    self._ignite(fire)
+                    rospy.loginfo(
+                        '[INCIDENT] fire %d re-ignited at (%.2f, %.2f) worth '
+                        '%.0f, %.1f drone-s', fire.id, fire.x, fire.y,
+                        fire.intensity, fire.work_total)
+                    moved = True
+
+            # -------- the work, and the payout ---------------------------
+            for fire in self._fires:
+                crew = self._crew[fire.id]
+                if not crew or not fire.burning:
+                    continue
+
+                # On station AND with something in the tank. This is the line
+                # the whole ground fleet exists to serve: a dry drone holding a
+                # perfect hover over a fire achieves precisely nothing, and the
+                # only way it gets wet again is another vehicle driving to it.
+                on_station = [ns for ns in crew if self._on_station(ns, fire)]
+                working = [ns for ns in on_station if self._litres[ns] > 0.0]
+
+                for ns in on_station:
+                    # Being over the fire is what proves the drone has not
+                    # abandoned the job, so the commitment clock is reset by
+                    # presence rather than by useful work. A drone that is
+                    # there and dry is waiting for water, not shirking.
+                    self._working_at[ns] = now
+
+                for ns in working:
+                    # Bombing is the water going somewhere. Metered against the
+                    # same dt as the work so the two can never disagree about
+                    # how long a drone was on station.
+                    self._litres[ns] = max(0.0, self._litres[ns] - self._flow * dt)
+                    if self._litres[ns] <= 0.0:
+                        rospy.loginfo('[INCIDENT] %s is dry over fire %d '
+                                      '(%.0f%% out) - needs a tender',
+                                      ns, fire.id,
+                                      100.0 * fire.work_done / fire.work_total)
+
+                if working:
+                    # n drones, n seconds of work per second. This is the whole
+                    # reason a crew is worth joining.
+                    fire.work_done += len(working) * dt
+
+                if fire.work_done < fire.work_total:
+                    continue
+
+                # Out. Equal shares to everyone who chose it - including a
+                # member that contributed nothing, which is what "shared
+                # equally between the drones that chose it" means and is
+                # exactly why the commitment has a timeout behind it.
+                reward = fire.intensity / float(len(crew))
+                for ns in list(crew):
+                    self._score[ns] += reward
+                    self._drops[ns] += 1
+                    self._committed[ns] = None
+                    outbox.append((ns, fire.to_msg(crew=len(crew),
+                                                   suppressed=True,
+                                                   reward=reward)))
+                rospy.loginfo(
+                    '[INCIDENT] fire %d (worth %.0f) OUT at (%.2f, %.2f) - crew '
+                    'of %d took %.1f drone-s, %.2f each | %s',
+                    fire.id, fire.intensity, fire.x, fire.y, len(crew),
+                    fire.work_total, reward,
+                    ' '.join('%s=%.1f' % (ns, self._score[ns]) for ns in crew))
+                self._crew[fire.id] = []
+                self._extinguish(fire)
+                moved = True
+
+            # -------- drones that are not turning up ---------------------
+            # A commitment nothing can break is a crew that waits forever on an
+            # aircraft wedged in a thicket or stuck in a respawn loop. This is
+            # the only involuntary way out, and it is deliberately long: it is
+            # a fault handler, not a way to change your mind.
+            if self._commit_to > 0.0:
+                for ns in self._drones:
+                    fire_id = self._committed[ns]
+                    if fire_id is None:
+                        continue
+                    last = max(self._commit_at[ns], self._working_at[ns])
+                    if (now - last).to_sec() > self._commit_to:
+                        self._release(ns, fire_id,
+                                      'not on station for %.0f s' % self._commit_to)
+
+            # -------- the slow backstop ----------------------------------
+            # A fire nobody has chosen in a long time burns out on its own and
+            # lights elsewhere. Uncrewed only: a fire with drones committed to
+            # it is being flown to, and moving it under them would strand a
+            # whole coalition rather than one drone.
+            for fire in self._fires:
+                if self._crew[fire.id] or not fire.burning:
+                    continue
+                if (self._reignite > 0.0 and
+                        (now - fire.ignited_at).to_sec() > self._reignite):
+                    rospy.loginfo('[INCIDENT] fire %d has burned unchosen for '
+                                  '%.0f s - letting it burn out', fire.id,
+                                  self._reignite)
+                    self._extinguish(fire)
+                    moved = True
+
+            # -------- what everybody is doing next -----------------------
+            for fire in self._fires:
+                crew = self._crew[fire.id]
+                for i, ns in enumerate(crew):
+                    outbox.append((ns, fire.to_msg(
+                        crew=len(crew),
+                        station=self._station(fire, i, len(crew)))))
+
+            # Burning fires only. A slot that is out is not somewhere a drone
+            # can be sent, and leaving it on the board would have the fleet
+            # bidding on the patch of ground where a fire used to be.
+            board = HotspotArray()
+            board.header.stamp = now
+            board.header.frame_id = 'world'
+            board.hotspots = [f.to_msg(crew=len(self._crew[f.id]))
+                              for f in self._fires if f.burning]
+
+        # Published outside the lock: a subscriber callback that claims in
+        # response would otherwise deadlock against the ledger it is claiming
+        # into.
+        for ns, msg in outbox:
+            self._target_pub[ns].publish(msg)
+        self._hotspot_pub.publish(board)
+        self._water_pub.publish(self._water_board(now))
+        self._publish_markers()
+        if moved:
+            rospy.logdebug('[INCIDENT] fire ground changed')
+
+
+def main():
+    IncidentController()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

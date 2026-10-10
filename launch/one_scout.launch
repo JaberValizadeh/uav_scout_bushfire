@@ -1,0 +1,171 @@
+<?xml version="1.0"?>
+<!-- One AgileX Scout V2, as a water tender.
+
+     Included once per ground robot by bushfire_coop.launch, inside a
+     <group ns="..."> so every topic, service, controller and parameter is
+     namespaced by construction: /scout_0/cmd_vel, /scout_0/odom, /scout_0/scan.
+
+     Namespacing a ros_control robot is the fiddly part of running two of these
+     in one Gazebo, and there are three separate places it has to be done or
+     the second Scout silently drives the first one's wheels:
+
+       robot_description   built with robot_namespace:=$(arg ns), which is what
+                           the gazebo_ros_control plugin inside the description
+                           reads to decide which namespace to look for its
+                           controller manager in.
+       the controller yaml loaded inside this group, so the four velocity
+                           controllers are /scout_0/scout_motor_*_controller.
+       the spawner         run inside the group as well, so it talks to
+                           /scout_0/controller_manager rather than the global
+                           one - which, with two robots up, belongs to whoever
+                           started first.
+
+     scout_gazebo's own scout_empty_world.launch does all of this in the global
+     namespace, because it was written to bring up exactly one robot. -->
+<launch>
+  <arg name="ns" doc="Namespace and Gazebo model name, e.g. scout_0" />
+  <arg name="x"   default="0.0" />
+  <arg name="y"   default="0.0" />
+  <arg name="yaw" default="0.0" />
+
+  <arg name="dock_index" default="0" />
+  <arg name="dock_count" default="2" />
+  <arg name="dock_radius" default="1.60" />
+  <arg name="standoff" default="2.0" />
+  <arg name="linear_speed" default="1.1" />
+  <arg name="reserve_litres" default="45.0" />
+  <arg name="full_litres" default="235.0" />
+  <arg name="obstacles" default="[]" />
+
+  <!-- Fire, which this vehicle cannot see. The flames are spawned with no
+       collision so an aircraft can fly down into one, which also means they
+       return nothing to the Hokuyo: without these the tender drives straight
+       through a burning fire at full speed and neither the laser filter nor
+       the costmap has anything to say about it.
+
+       flame_scale MUST match the incident controller's, because the tender
+       derives a fire's radius from the same expression that sizes the flame
+       model. Keeping the two in step is what stops a scout clipping the
+       visible edge of a 10. -->
+  <arg name="flame_scale" default="1.0" />
+  <!-- Vehicle half-width plus clearance, added to the flame radius. -->
+  <arg name="fire_margin" default="0.60" />
+  <!-- Band outside the keep-out where it eases off, and the speed it eases to. -->
+  <arg name="fire_caution" default="1.50" />
+  <arg name="fire_creep_speed" default="0.30" />
+  <!-- How far ahead a candidate heading must stay clear, and the margin it
+       must clear the keep-out by. The buffer matters because this is a
+       skid-steer that scrubs when it turns: a heading that is exactly tangent
+       in the plan is inside the fire on the ground. -->
+  <arg name="fire_lookahead" default="4.0" />
+  <arg name="fire_pass_buffer" default="0.25" />
+  <arg name="nav" default="true" doc="drive with move_base rather than the built-in reactive controller" />
+
+  <!-- The laser-equipped overlay from this package, not the stock description.
+       The Scout ships with no sensors at all, and this robot has to cross a
+       stand of trees that are in no map it has. See the xacro's header for why
+       the scanner is on a front boom rather than on the deck. -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro '$(find uav_scout_bushfire)/urdf/scout_v2_laser.urdf.xacro' robot_namespace:=$(arg ns)" />
+
+  <node name="spawn_scout" pkg="gazebo_ros" type="spawn_model" output="screen"
+        args="-urdf -param robot_description -model $(arg ns)
+              -x $(arg x) -y $(arg y) -z 0.2 -Y $(arg yaw)" />
+
+  <!-- No controller_manager, no controller spawner and no skid-steer node.
+       The stock scout_gazebo stack needs velocity_controllers, which is not
+       installed here, and the wheel-level Gazebo plugin cannot be used either
+       because the Scout's right-hand wheels have a flipped joint axis - both
+       are explained at length in the xacro. The tender drives with
+       libgazebo_ros_planar_move.so instead, declared in the description, so
+       everything below is just the model, its TF, and the behaviour. -->
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher"
+        type="robot_state_publisher">
+    <param name="tf_prefix" value="$(arg ns)" />
+  </node>
+
+  <!-- The wheels, purely so the vehicle draws complete in RViz.
+       planar_move drives the body directly rather than through wheel
+       controllers, so nothing publishes joint_states and the four wheel joints
+       have no transform - robot_state_publisher emits the frames it can and
+       RViz's RobotModel reports Status: Error for the links it cannot place.
+       The scenario never noticed, because nothing but the display cares where
+       a wheel is. This publishes them at rest, which is honest: the wheels are
+       not simulated as turning either. -->
+  <node name="joint_state_publisher" pkg="joint_state_publisher"
+        type="joint_state_publisher">
+    <param name="use_gui" value="false" />
+    <param name="rate" value="10" />
+  </node>
+
+  <!-- Path planning and obstacle avoidance. Off if the navigation stack is not
+       installed, in which case water_tender falls back to its own reactive
+       laser controller and says so. -->
+  <include if="$(arg nav)"
+           file="$(find uav_scout_bushfire)/launch/scout_navigation.launch">
+    <arg name="ns" value="$(arg ns)" />
+  </include>
+
+  <node name="water_tender" pkg="uav_scout_bushfire" type="water_tender"
+        output="screen"
+        launch-prefix="bash -c 'sleep 16 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="linear_speed"   value="$(arg linear_speed)" />
+    <!-- Loose by an aircraft's standards, and it has to be. Skid-steer scrubs
+         when it turns, so chasing a heading tighter than the vehicle can hold
+         is wheelspin that never converges. -->
+    <param name="angle_tol"      value="0.20" />
+    <param name="angular_gain"   value="1.6" />
+    <param name="max_angular"    value="1.2" />
+    <param name="arrive_radius"  value="0.35" />
+    <param name="slow_dist"      value="1.5" />
+    <!-- Park this far from the fire it is serving. Must clear the crew ring
+         (up to 0.75 m) plus a rotor span plus this vehicle's own half-length,
+         because three aircraft come down to 0.95 m inside that ring. -->
+    <param name="standoff"       value="$(arg standoff)" />
+    <param name="flame_scale"      value="$(arg flame_scale)" />
+    <param name="fire_margin"      value="$(arg fire_margin)" />
+    <param name="fire_caution"     value="$(arg fire_caution)" />
+    <param name="fire_creep_speed" value="$(arg fire_creep_speed)" />
+    <param name="fire_lookahead"   value="$(arg fire_lookahead)" />
+    <param name="fire_pass_buffer" value="$(arg fire_pass_buffer)" />
+    <!-- The trees. A tender parked beside a trunk puts one of the drone
+         holding slots above it inside the tree, and station-keeping is the one
+         command the aircraft's laser filter cannot shape - so the standing
+         point has to be chosen clear rather than corrected later. -->
+    <rosparam param="obstacles" subst_value="true">$(arg obstacles)</rosparam>
+    <param name="drone_hold_radius" value="2.0" />
+    <param name="rotor_radius"      value="0.40" />
+    <param name="reserve_litres" value="$(arg reserve_litres)" />
+    <param name="full_litres"    value="$(arg full_litres)" />
+    <!-- The dam is one place and both tenders need it, so it gets numbered
+         docking slots the way a fire gets numbered crew stations. -->
+    <param name="dock_index"     value="$(arg dock_index)" />
+    <param name="dock_count"     value="$(arg dock_count)" />
+    <param name="dock_radius"    value="$(arg dock_radius)" />
+    <!-- Standing points are kept apart by the tenders hearing each other's
+         claims. 3.0 m is comfortably more than two vehicle lengths, and more
+         than the spacing between a fire and its neighbours' crews. -->
+    <param name="tender_separation" value="3.0" />
+    <!-- Re-examine where to stand at most this often. The board changes at
+         10 Hz; a skid-steer vehicle that re-aims at 10 Hz spends the run
+         turning on the spot and never arrives anywhere. -->
+    <param name="repick_period"  value="4.0" />
+    <param name="avoid_dist"     value="1.4" />
+    <param name="stop_dist"      value="0.7" />
+    <param name="min_valid_range" value="0.10" />
+    <param name="back_off_speed" value="0.25" />
+    <param name="avoid_hold"     value="1.2" />
+    <!-- Wider than the drones' 8.8: this vehicle has to reach the dam in the
+         corner at (8.5, 8.5), which is outside the ground the aircraft work. -->
+    <param name="fence_half_size" value="9.4" />
+    <!-- Hand the driving to move_base: water_tender then decides *where* to
+         stand and sends that as a goal, instead of steering there itself. The
+         choice of standing point is unchanged either way - it is the one thing
+         in this node that is about the scenario rather than about driving. -->
+    <param name="use_move_base"  value="$(arg nav)" />
+    <param name="control_hz"     value="20.0" />
+    <param name="status_hz"      value="0.5" />
+  </node>
+
+</launch>

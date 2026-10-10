@@ -1,0 +1,20 @@
+# The rolling window the local planner steers inside.
+local_costmap:
+  global_frame: odom_ns       # overwritten per robot in the launch
+  update_frequency: 5.0
+  publish_frequency: 2.0
+  transform_tolerance: 0.5
+
+  static_map: false
+  rolling_window: true
+  width: 6.0
+  height: 6.0
+  resolution: 0.05
+
+  # No static layer here on purpose. What the local costmap is for is the
+  # things the map does not know about - the other tender, and a drone that has
+  # landed somewhere it should not have - and re-inflating the trees it already
+  # planned around only makes the window expensive.
+  plugins:
+    - {name: obstacle_layer,  type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}

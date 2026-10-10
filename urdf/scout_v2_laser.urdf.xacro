@@ -1,0 +1,223 @@
+<?xml version="1.0"?>
+<!--
+  AgileX Scout V2 with a scanning laser, for driving in timber.
+
+  The stock Scout description carries no sensors whatsoever - it is a drive
+  base with four wheels and a deck. That is fine on an empty playpen and
+  useless here: this robot has to cross a stand of trees between the fire
+  ground and the dam, and the trees are not in any map it has.
+
+  Where the scanner goes
+  ......................
+  On a mast above the deck, at 0.50 m. The Scout's body is 0.925 x 0.38 m and
+  stands 0.34 m off the ground, so anything mounted at deck height looks down
+  the length of its own vehicle and a reactive filter fed those returns
+  believes it is boxed in. The mast clears the body, which also means a clean
+  270 degrees rather than the 200 a front boom can manage without seeing
+  itself.
+
+  This is the opposite of the choice the quadrotors make about mast height,
+  and for the opposite reason: an aircraft pitches to translate, so its scan
+  plane tips and a short mast ends up looking through its own rotors. A Scout
+  stays level, so height costs nothing here.
+
+  The cost that does exist is that one Scout's plane passes over another one -
+  their decks are at 0.34 m. That is what the visibility pole below is for,
+  and with move_base planning on this scan it is not optional.
+
+  What it still cannot see
+  ........................
+  The drones. They cruise at 2.0 m and come down to 1.25 m over a tender; the
+  plane is at 0.50 m. That is the right way round - a ground robot that swerved
+  for an aircraft a metre and a half above it would be a nuisance - but it
+  means deconfliction between the fleets is vertical separation and nothing
+  else, which is only sound because the one place a drone comes low near a
+  Scout is the refill hover, directly over a tender that is stopped.
+
+  It also cannot see the fires, which have no collision geometry at all. That
+  is deliberate in the fire model and convenient here: a tender is allowed to
+  stand close to a fire without its costmap fighting the standing point.
+
+  Deck friction
+  .............
+  Carried over from scout_gazebo's own simulation overlay. base_link has no
+  surface properties in the stock description, which leaves the deck at
+  Gazebo's defaults - it matters here because a tender is a thing drones hover
+  over and station-keep against, not just a drive base.
+-->
+<robot name="scout_v2" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="robot_namespace" default="/" />
+
+  <xacro:include filename="$(find scout_description)/urdf/scout_v2.xacro" />
+
+  <gazebo reference="base_link">
+    <mu1>1.5</mu1>
+    <mu2>1.5</mu2>
+    <kp>1000000.0</kp>
+    <kd>10.0</kd>
+    <minDepth>0.001</minDepth>
+    <maxContacts>32</maxContacts>
+  </gazebo>
+
+  <!-- How this robot drives, and why it is not the stock stack
+       .......................................................
+       scout_gazebo drives the Scout through ros_control: one
+       velocity_controllers/JointVelocityController per wheel, plus its
+       scout_skid_steer.py node to turn /cmd_vel into four wheel commands with
+       the right signs. That is the physically honest way to do it and it is
+       not available here - `velocity_controllers` is not installed on this
+       machine, so all four controllers fail to load with
+
+           Could not load controller 'scout_motor_fl_controller' because
+           controller type 'velocity_controllers/JointVelocityController'
+           does not exist
+
+       and the vehicle sits there. `sudo apt install ros-noetic-velocity-
+       controllers` fixes that if you would rather have the wheel-level drive;
+       see the README.
+
+       The wheel-level Gazebo plugin, libgazebo_ros_skid_steer_drive.so, is
+       installed but cannot be used either, and the reason is in the Scout's
+       own description: the right-hand wheels are mounted rpy="3.14 0 0",
+       which flips their declared axis "0 -1 0" to "0 +1 0" in the base_link
+       frame. That plugin applies one sign convention to all four joints, so a
+       forward command drives the left wheels forward and the right wheels
+       backward, and the robot pirouettes. Fixing it would mean redefining the
+       wheel macros, which is a lot of surgery on somebody else's robot to
+       avoid one apt package.
+
+       So the tender drives with libgazebo_ros_planar_move.so, which AgileX's
+       own description offers as the alternative (it is the second commented
+       out block in scout_v2.gazebo). It takes /cmd_vel in the body frame and
+       moves the base directly. The wheels do not turn, which is the honest
+       cost of it, and for this scenario the trade is a good one: what the rest
+       of the package needs from a tender is that it be *where the water board
+       says it is*, because the drones fly at that position and the ledger
+       decides whether a refill is happening from the same number. A kinematic
+       drive is better at that than a skid-steer one, not worse. -->
+  <gazebo>
+    <plugin name="tender_drive" filename="libgazebo_ros_planar_move.so">
+      <robotNamespace>$(arg robot_namespace)</robotNamespace>
+      <commandTopic>cmd_vel</commandTopic>
+      <odometryTopic>odom</odometryTopic>
+      <odometryFrame>$(arg robot_namespace)/odom</odometryFrame>
+      <odometryRate>50.0</odometryRate>
+      <!-- Prefixed, or the TF tree is two disconnected halves: this plugin
+           publishes <ns>/odom -> base_link while robot_state_publisher (with
+           tf_prefix) publishes <ns>/base_link -> <ns>/laser0_frame. Nothing
+           noticed while the tender drove itself by raw odometry; move_base
+           notices immediately, because it has to transform a scan in
+           <ns>/laser0_frame into a costmap in map. -->
+      <robotBaseFrame>$(arg robot_namespace)/base_link</robotBaseFrame>
+    </plugin>
+  </gazebo>
+
+  <!-- The base is driven kinematically, so the wheels are along for the ride
+       and their stock friction only fights it. Dropped to a slither, which
+       keeps the vehicle from juddering as the contacts load and unload. It
+       still rests on them, so it sits at the right height and the laser boom
+       is where the geometry above says it is. -->
+  <xacro:macro name="slick_wheel" params="name">
+    <gazebo reference="${name}">
+      <mu1>0.05</mu1>
+      <mu2>0.05</mu2>
+    </gazebo>
+  </xacro:macro>
+  <xacro:slick_wheel name="front_left_wheel_link" />
+  <xacro:slick_wheel name="front_right_wheel_link" />
+  <xacro:slick_wheel name="rear_left_wheel_link" />
+  <xacro:slick_wheel name="rear_right_wheel_link" />
+
+  <!-- The mast. Cosmetic - it gives the scanner something to stand on - but a
+       real link with a real (tiny) mass, so the inertia the solver sees is the
+       one the model declares. -->
+  <link name="laser_mast">
+    <inertial>
+      <mass value="0.01" />
+      <origin xyz="0 0 0" />
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.020" length="0.26" />
+      </geometry>
+      <material name="mast_grey">
+        <color rgba="0.3 0.3 0.32 1.0" />
+      </material>
+    </visual>
+  </link>
+
+  <joint name="laser_mast_joint" type="fixed">
+    <parent link="base_link" />
+    <child  link="laser_mast" />
+    <!-- base_link is 0.235 m off the ground and the body top is at 0.34, so
+         z = +0.135 stands the mast from the deck up to the scanner at 0.50 m. -->
+    <origin xyz="0.0 0 0.135" rpy="0 0 0" />
+  </joint>
+
+  <!-- The visibility pole, and why a navigation stack needs one
+       .........................................................
+       A Scout's deck is 0.34 m off the ground and the scanner now sits at
+       0.50 m, so one Scout's scan plane passes clean over another one. That
+       was tolerable when the tender drove by a reactive filter and its
+       standing points were kept metres apart by agreement; it is not
+       tolerable with move_base, whose local costmap is built from this scan
+       and which will happily plan a path through a vehicle it cannot see.
+
+       A real survey vehicle solves this with a whip or a flag. So does this
+       one: a 0.05 m pole from the deck to 0.75 m, with collision, mounted at
+       the back of the deck. It rises 0.25 m through every other Scout's scan
+       plane, which is what makes each robot a dynamic obstacle in the others'
+       costmap rather than a hole in it.
+
+       At the back rather than the middle because a drone hovers over the deck
+       to take water. The pole tops out at 0.75 m and the refill hover is at
+       1.25 m, so there is half a metre of clearance and 0.30 m of horizontal
+       offset on top of it. -->
+  <link name="visibility_pole">
+    <inertial>
+      <mass value="0.02" />
+      <origin xyz="0 0 0" />
+      <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5" />
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.05" length="0.40" /></geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.05" length="0.40" /></geometry>
+      <material name="pole_orange">
+        <color rgba="0.95 0.45 0.05 1.0" />
+      </material>
+    </visual>
+  </link>
+
+  <joint name="visibility_pole_joint" type="fixed">
+    <parent link="base_link" />
+    <child  link="visibility_pole" />
+    <!-- Centre at 0.55 m above ground, so the pole spans 0.35 to 0.75 m. -->
+    <origin xyz="-0.30 0 0.315" rpy="0 0 0" />
+  </joint>
+
+  <!-- hector's Hokuyo, the same scanner the quadrotors carry, but opened out
+       to a full 270 degrees and 361 rays. The old 200-degree boom scan was cut
+       to that width purely to keep this vehicle's own chassis out of view, and
+       it was enough for a three-sector reactive filter. A costmap is a
+       different customer: it wants everything around the robot, because what
+       it is building is a picture rather than an answer to "is anything in
+       front of me". On the mast there is no self-hit to avoid, so the width
+       costs nothing.
+
+       10 Hz, as on the drones - five scanning vehicles at 40 Hz is real time
+       the simulation would rather spend on physics. -->
+  <xacro:include filename="$(find hector_sensors_description)/urdf/hokuyo_utm30lx.urdf.xacro" />
+  <xacro:hokuyo_utm30lx name="laser0" parent="base_link" ros_topic="scan"
+                        update_rate="10" ray_count="361"
+                        min_angle="-135" max_angle="135">
+    <origin xyz="0.0 0.0 0.265" rpy="0 0 0" />
+  </xacro:hokuyo_utm30lx>
+
+</robot>

@@ -1,0 +1,62 @@
+# Shared by both costmaps, loaded per robot inside its namespace.
+#
+# The footprint is the real Scout: the body is 0.925 x 0.38 m but the wheels
+# take it to 0.70 m across, and the visibility pole hangs 0.30 m off the back.
+# Given as a polygon rather than a radius because the vehicle is half again as
+# long as it is wide, and a circumscribed circle would refuse gaps it fits
+# through - which matters here, since the corridor between the outer tree ring
+# at 8.0 m and the firebreak at 10.0 m is most of how a tender reaches the dam.
+footprint: [[0.52, 0.37], [0.52, -0.37], [-0.52, -0.37], [-0.52, 0.37]]
+footprint_padding: 0.03
+
+transform_tolerance: 0.5
+map_type: costmap
+
+obstacle_layer:
+  enabled: true
+  obstacle_range: 8.0
+  raytrace_range: 10.0
+  # The one sensor this robot has. max_obstacle_height is well above the scan
+  # plane at 0.50 m and below the drones at 1.25 m and up, which is deliberate:
+  # a ground robot must not brake for an aircraft hovering over it.
+  observation_sources: laser fire
+  # Fire, which no sensor on this vehicle can detect: the flames are spawned
+  # with no collision so an aircraft can fly into them, so they return nothing
+  # to the laser and the planner routes straight across a burning fire.
+  # fire_costmap turns the fire board into this cloud.
+  #
+  # marking only. Raytrace clearing works from the sensor origin back through
+  # the cloud, and this cloud's origin is the frame origin - clearing would wipe
+  # every cell on the line from the middle of the arena out to each fire,
+  # including trunks the laser has legitimately marked. fire_costmap calls
+  # clear_costmaps itself when a fire goes out.
+  fire:
+    sensor_frame: map
+    data_type: PointCloud2
+    topic: /bushfire/fire_cloud
+    marking: true
+    clearing: false
+    min_obstacle_height: 0.0
+    max_obstacle_height: 1.0
+  laser:
+    sensor_frame: ""          # taken from the scan message
+    data_type: LaserScan
+    topic: scan
+    marking: true
+    clearing: true
+    min_obstacle_height: 0.0
+    max_obstacle_height: 1.0
+    inf_is_valid: true
+
+inflation_layer:
+  enabled: true
+  # Half the vehicle's width plus a margin. Larger than this and the 1.6 m gaps
+  # between neighbouring trunks in the inner ring inflate shut, and the global
+  # planner routes the long way round every time.
+  inflation_radius: 0.55
+  cost_scaling_factor: 4.0
+
+static_layer:
+  enabled: true
+  map_topic: /map            # shared: one map_server, every robot subscribes
+  subscribe_to_updates: true

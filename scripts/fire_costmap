@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+fire_costmap - puts the fires into the navigation stack's costmap.
+
+Fire is invisible to everything the Scouts sense. The flames are spawned with no
+collision at all, deliberately, so an aircraft can fly down into one - which
+also means they return nothing to the Hokuyo. The laser sees straight through a
+burning fire, the obstacle layer marks nothing, and move_base plans a route
+across it because as far as the costmap is concerned there is nothing there.
+
+water_tender does carry its own fire avoidance, but only on the reactive
+driving path. Its control loop hands over to move_base and returns before any of
+it runs:
+
+    if self._nav is not None:
+        self._navigate(gx, gy)
+        return
+
+so turning the navigation stack on - which is the right thing for planning round
+timber - switched every bit of that off. The tenders went straight back to
+driving through fires, and correctly so: nothing had told the planner.
+
+This node is the missing half. It turns the fire board into a PointCloud2 that
+the costmaps take as an observation source, so a fire is an obstacle to the
+global planner and gets routed around like a tree.
+
+Marking only, and why the clearing is done by hand
+--------------------------------------------------
+The obstacle layer clears by raytracing from the sensor origin back through the
+cloud. That works for a real sensor and is actively wrong here: this cloud's
+origin would be the frame origin, so raytracing would clear every cell on the
+line from the middle of the arena out to each fire - including the trunks the
+laser has legitimately marked.
+
+So the source is marking-only, and staleness is handled explicitly instead: when
+a fire goes out or relights somewhere else, this node calls
+move_base's clear_costmaps. Anything real that gets wiped with it is re-marked
+from the laser within a cycle, which is what that service is for.
+
+Points, not a circle
+--------------------
+A filled disc rather than a ring. A ring lets the planner thread a path through
+the middle of a fire - the cells inside are unmarked and cheaper than going
+round - and it will, because that is the shortest route.
+
+Publications
+------------
+  /bushfire/fire_cloud     sensor_msgs/PointCloud2   filled discs, ~map frame
+
+ROS Parameters (private, ~)
+---------------------------
+  ~frame          str    frame the cloud is published in     (default map)
+  ~rate           float  Hz                                  (default 5.0)
+  ~flame_scale    float  must match the incident controller  (default 1.0)
+  ~fire_margin    float  added to the flame radius, m        (default 0.60)
+  ~point_spacing  float  disc fill spacing, m                (default 0.15)
+  ~height         float  z of the points; must sit inside the
+                         obstacle layer's height band, m     (default 0.50)
+  ~clear_services list   move_base clear_costmaps services
+"""
+
+import math
+import struct
+
+import rospy
+from sensor_msgs.msg import PointCloud2, PointField
+from std_srvs.srv import Empty
+
+from uav_bushfire.msg import HotspotArray
+
+
+class FireCostmap(object):
+
+    def __init__(self):
+        rospy.init_node('fire_costmap')
+
+        self._frame = rospy.get_param('~frame', 'map')
+        rate = rospy.get_param('~rate', 5.0)
+        self._scale = rospy.get_param('~flame_scale', 1.0)
+        self._margin = rospy.get_param('~fire_margin', 0.60)
+        self._spacing = rospy.get_param('~point_spacing', 0.15)
+        self._z = rospy.get_param('~height', 0.50)
+        self._clear_names = rospy.get_param(
+            '~clear_services',
+            ['/scout_0/move_base/clear_costmaps',
+             '/scout_1/move_base/clear_costmaps'])
+
+        self._fires = []
+        self._sig = None            # what the board looked like last tick
+
+        self._pub = rospy.Publisher('/bushfire/fire_cloud', PointCloud2,
+                                    queue_size=1)
+        rospy.Subscriber('/bushfire/hotspots', HotspotArray, self._cb,
+                         queue_size=1)
+        rospy.Timer(rospy.Duration(1.0 / max(rate, 0.1)), self._tick)
+        rospy.loginfo('[FIRECOST] publishing fires as costmap obstacles on '
+                      '/bushfire/fire_cloud in %s', self._frame)
+
+    def _radius(self, intensity):
+        i = max(1.0, min(10.0, intensity))
+        return self._scale * (0.62 + 0.081 * (i - 1.0)) + self._margin
+
+    def _cb(self, msg):
+        self._fires = [(f.x, f.y, self._radius(f.intensity))
+                       for f in msg.hotspots]
+        # Rounded, so a fire's own jitter does not count as a change and call
+        # clear_costmaps several times a second.
+        sig = tuple(sorted((round(x, 1), round(y, 1), round(r, 1))
+                           for x, y, r in self._fires))
+        if self._sig is not None and sig != self._sig:
+            self._clear()
+        self._sig = sig
+
+    def _clear(self):
+        """Wipe the costmaps so a fire that has gone out stops being an obstacle.
+
+        Marking-only sources never un-mark themselves, so without this a fire
+        that is put out leaves a permanent hole in the map and the tenders route
+        round a patch of cold ground for the rest of the run.
+        """
+        for name in self._clear_names:
+            try:
+                rospy.wait_for_service(name, timeout=0.5)
+                rospy.ServiceProxy(name, Empty)()
+            except rospy.ROSException:
+                pass            # move_base not up yet, or not running at all
+            except rospy.ServiceException as exc:
+                rospy.logwarn_throttle(10.0, '[FIRECOST] %s: %s', name, exc)
+
+    def _points(self):
+        pts = []
+        for fx, fy, r in self._fires:
+            n = max(1, int(r / self._spacing))
+            for i in range(-n, n + 1):
+                for j in range(-n, n + 1):
+                    dx, dy = i * self._spacing, j * self._spacing
+                    if dx * dx + dy * dy <= r * r:
+                        pts.append((fx + dx, fy + dy, self._z))
+        return pts
+
+    def _tick(self, _):
+        pts = self._points()
+        msg = PointCloud2()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = self._frame
+        msg.height = 1
+        msg.width = len(pts)
+        msg.fields = [
+            PointField('x', 0, PointField.FLOAT32, 1),
+            PointField('y', 4, PointField.FLOAT32, 1),
+            PointField('z', 8, PointField.FLOAT32, 1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * len(pts)
+        msg.is_dense = True
+        msg.data = b''.join(struct.pack('<fff', *p) for p in pts)
+        # Published even when empty: an empty cloud is a live source saying
+        # "no fires", and the costmap needs the message to keep the observation
+        # buffer from going stale and complaining.
+        self._pub.publish(msg)
+
+
+def main():
+    FireCostmap()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

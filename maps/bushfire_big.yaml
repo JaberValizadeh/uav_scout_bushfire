@@ -1,0 +1,12 @@
+# The shared map, served once by map_server and used by every Scout.
+#
+# Generated from the same numbers that built worlds/bushfire_big.world rather
+# than driven out with gmapping - see the README for why. origin is the world
+# frame corner, so map coordinates and Gazebo coordinates are the same numbers
+# and "map" and "world" mean the same thing.
+image: bushfire_big.pgm
+resolution: 0.050
+origin: [-10.600, -10.600, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

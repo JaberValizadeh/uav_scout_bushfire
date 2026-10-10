@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""
+coop_monitor - passive observer for the whole incident, both fleets at once.
+
+It commands nothing and decides nothing. uav_bushfire had one of these per
+drone, logging that aircraft's pose and its assignment, and that was the right
+shape when every vehicle was the same kind of vehicle doing the same kind of
+thing. It is the wrong shape here: the question this scenario raises is not
+"what is uav_1 doing" but "is the supply chain keeping up", and that cannot be
+answered from inside any one vehicle.
+
+So there is one of these for the run, and what it prints is the chain:
+
+    dam  --->  scout tender  --->  drone  --->  fire
+
+with the level in every tank on it. A fleet that is working properly shows
+drones cycling between full and empty and tenders draining slowly; a fleet that
+is not shows several drones sitting at 0 L, which means they are hovering over
+fires achieving nothing and the ground half is not keeping up.
+
+Subscriptions
+-------------
+  /bushfire/water     uav_scout_bushfire/WaterBoard   every tank, and the dam
+  /bushfire/hotspots  uav_bushfire/HotspotArray       the fire ground
+  /bushfire/tenders   uav_scout_bushfire/TenderClaim  where the scouts are going
+
+ROS Parameters (private, ~)
+---------------------------
+  ~log_hz   float  Rate the incident summary is printed (default 0.5 Hz)
+"""
+
+import rospy
+
+from uav_bushfire.msg import HotspotArray
+from uav_scout_bushfire.msg import WaterBoard, TenderClaim
+
+_RESET  = '\033[0m'
+_BOLD   = '\033[1m'
+_YELLOW = '\033[93m'
+_GREEN  = '\033[92m'
+_CYAN   = '\033[96m'
+_RED    = '\033[91m'
+_BLUE   = '\033[94m'
+
+
+def _gauge(litres, capacity, width=10):
+    """A tank as a bar. Colour is the alarm: empty drones are the failure."""
+    frac = 0.0 if capacity <= 0 else max(0.0, min(1.0, litres / capacity))
+    filled = int(round(width * frac))
+    colour = _RED if frac < 0.12 else (_YELLOW if frac < 0.35 else _GREEN)
+    return '%s%s%s%s' % (colour, '#' * filled, '-' * (width - filled), _RESET)
+
+
+class CoopMonitor(object):
+
+    def __init__(self):
+        rospy.init_node('coop_monitor', anonymous=False)
+
+        self._log_hz = rospy.get_param('~log_hz', 0.5)
+
+        self._board = None
+        self._fires = []
+        self._headings = {}
+
+        rospy.Subscriber('/bushfire/water', WaterBoard, self._water_cb)
+        rospy.Subscriber('/bushfire/hotspots', HotspotArray, self._fires_cb)
+        rospy.Subscriber('/bushfire/tenders', TenderClaim, self._tender_cb)
+
+        rospy.Timer(rospy.Duration(1.0 / max(self._log_hz, 0.01)), self._report)
+        rospy.loginfo('[COOP] watching the incident at %.2f Hz', self._log_hz)
+
+    def _water_cb(self, msg):
+        self._board = msg
+
+    def _fires_cb(self, msg):
+        self._fires = msg.hotspots
+
+    def _tender_cb(self, msg):
+        self._headings[msg.scout] = msg.fire_id
+
+    def _report(self, _event):
+        if self._board is None:
+            return
+
+        drones = [t for t in self._board.tanks if not t.tender]
+        tenders = [t for t in self._board.tanks if t.tender]
+
+        burning = len(self._fires)
+        crewed = sum(1 for f in self._fires if f.crew > 0)
+        on_fires = sum(f.crew for f in self._fires)
+        dry = sum(1 for d in drones if d.litres < 0.4)
+
+        print(flush=True)
+        print(_BOLD + '  === incident ' + '=' * 52 + _RESET, flush=True)
+        print('   fires: %s%d burning%s, %d crewed, %d drone(s) on them   '
+              'dam at (%.1f, %.1f)'
+              % (_YELLOW, burning, _RESET, crewed, on_fires,
+                 self._board.dam_x, self._board.dam_y), flush=True)
+
+        for t in tenders:
+            where = self._headings.get(t.vehicle, -1)
+            going = ('fire %d' % where) if where >= 0 else 'the dam / centre'
+            print('   %s%-8s%s [%s] %5.0f/%-5.0f L  %s  at (%6.2f,%6.2f) '
+                  'heading for %s'
+                  % (_BLUE, t.vehicle, _RESET, _gauge(t.litres, t.capacity),
+                     t.litres, t.capacity,
+                     _GREEN + 'STANDING' + _RESET if t.ready
+                     else _CYAN + 'driving ' + _RESET,
+                     t.x, t.y, going))
+
+        for d in drones:
+            print('   %s%-8s%s [%s] %5.0f/%-5.0f L  at (%6.2f,%6.2f)%s'
+                  % (_CYAN, d.vehicle, _RESET, _gauge(d.litres, d.capacity),
+                     d.litres, d.capacity, d.x, d.y,
+                     '  %sDRY%s' % (_RED, _RESET) if d.litres < 0.4 else ''))
+
+        # The one line worth reading if you read nothing else. Drones sitting
+        # empty are the failure mode this whole package exists to avoid: they
+        # are on station, holding a perfect hover, and putting out nothing.
+        if dry:
+            print('   %s%d drone(s) dry and waiting on water%s'
+                  % (_RED + _BOLD, dry, _RESET), flush=True)
+        print(flush=True)
+
+
+def main():
+    CoopMonitor()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

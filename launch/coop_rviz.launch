@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<!--
+  coop_rviz.launch
+  ================
+  RViz for the cooperation, on its own.
+
+    roslaunch uav_scout_bushfire coop_rviz.launch
+
+  Attaches to an incident that is already running. Nothing here publishes to the
+  scenario - it subscribes and draws - so it can be started, killed and started
+  again at any point in a run without disturbing Gazebo, the planners or the
+  fleets. That is the point of it being a separate file: the world takes the
+  longest to load and is the thing you least want to restart.
+
+  bushfire_coop.launch includes this when rviz:=true, so there is one definition
+  of what the view is rather than two that drift.
+
+  What to look at
+  ===============
+  Fire as obstacles   the fire_costmap cloud. This is the display that answers
+                      "why did a tender drive through that fire" - if it is
+                      missing or in the wrong place, move_base is blind to fire.
+  scout_N plan        each tender's live route round the timber and the fires.
+  Shared map          the occupancy grid both Scouts plan on.
+
+  The aircraft scans are off by default. Three more planes of dots over the same
+  trunks makes the picture harder to read, not easier; tick them on when the
+  question is about what a drone can see.
+-->
+<launch>
+
+  <arg name="rviz_config" default="$(find uav_scout_bushfire)/rviz/coop.rviz" />
+  <arg name="delay" default="0"
+       doc="bushfire_coop.launch waits for the world; started by hand, do not" />
+
+  <!-- Join the two TF trees, so one RViz can show the whole incident.
+       The aircraft are published under `world` (Gazebo ground truth) and the
+       Scouts under `map` (the navigation stack), and nothing else connects
+       them - so RViz in `world` draws the drones and no scouts, and in `map`
+       the reverse, with the map, costmaps and plans visible in neither.
+
+       Identity, and correctly so: the map was generated from this world with
+       its origin field placing the image corner at (-10.6, -10.6), which puts
+       the map frame's origin on the arena centre, where the world origin is.
+       The residual difference is the Scouts' odometry drift, measured at about
+       0.28 m after several minutes of driving - which is what AMCL would
+       correct if this used it, and is why this is published rather than
+       assumed.
+
+       It lives here rather than in bushfire_coop.launch because it exists for
+       the benefit of the view: nothing in the scenario looks it up. -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_map"
+        args="0 0 0 0 0 0 world map" />
+
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(arg rviz_config)"
+        output="screen" required="false"
+        launch-prefix="bash -c 'sleep $(arg delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --" />
+
+</launch>

@@ -1,0 +1,202 @@
+<?xml version="1.0"?>
+<!-- One aircraft: the airframe, a suppressor, a monitor.
+
+     Included three times by bushfire.launch with a different ns and start
+     position. Note what is *not* here any more - the fire ground. The treasure
+     version gave every drone its own spawner inside this file, because every
+     drone had its own private target; fires are shared and their value is
+     split between whoever chose them, so fire_spotter is started once by the
+     parent launch outside every namespace.
+
+     The choice of fire, though, does live here: the suppressor reads the whole
+     board and claims what it wants. Only the two topics it shares with the
+     fleet - /bushfire/hotspots and /bushfire/claims - are global.
+
+     Everything here is inside the caller's <group ns="...">, so every topic,
+     service and parameter is namespaced by construction: /uav_0/cmd_vel,
+     /uav_0/engage, /uav_0/scan, /uav_0/bushfire/target. hector's plugins take
+     the namespace from the enclosing group without being told, which is what
+     makes three of them in one Gazebo possible at all. -->
+<launch>
+  <arg name="ns" doc="Namespace and Gazebo model name, e.g. uav_0" />
+  <arg name="x" default="0.0" />
+  <arg name="y" default="0.0" />
+  <arg name="z" default="0.3" />
+
+  <arg name="cruise_altitude" />
+  <arg name="cruise_step" default="0.45" />
+  <arg name="drop_altitude" />
+  <arg name="linear_speed" />
+  <arg name="angular_gain" />
+  <arg name="avoid_dist" />
+  <arg name="stop_dist" />
+  <arg name="arrive_radius" />
+  <arg name="max_crew" default="3" />
+  <arg name="join_deadline" default="0.7" />
+  <arg name="reserve_litres" default="12.0" />
+  <!-- The other aircraft, so this one can keep clear of them. Needed because
+       the transit lanes make them invisible to each other's laser: a
+       horizontal scan plane cannot see an aircraft flying above or below it. -->
+  <!-- Choose the biggest fire on the board, not the one with the best
+       share-per-second. A fire's intensity is its value AND its size, so the
+       big one is the one that matters; the efficient ordering would clear
+       cheap fires next door while a 10 burned across the arena. Ties between
+       equal fires still fall back to efficiency. False restores the old
+       ordering. -->
+  <arg name="value_first" default="true" />
+
+  <arg name="peers" default="[uav_0, uav_1, uav_2]" />
+  <arg name="peer_radius" default="1.20" />
+  <arg name="peer_vsep" default="0.35" />
+  <arg name="peer_push" default="0.60" />
+
+  <arg name="hold_index" default="0" />
+  <arg name="hold_count" default="3" />
+
+  <!-- The airframe, its plugins and controller/twist, from hector's own spawn
+       launch with the model swapped for the laser-mast variant in this
+       package. name and tf_prefix must both be the namespace or the three
+       drones collide in Gazebo's model list and on TF. -->
+  <include file="$(find hector_quadrotor_gazebo)/launch/spawn_quadrotor.launch">
+    <arg name="name"      value="$(arg ns)" />
+    <arg name="tf_prefix" value="$(arg ns)" />
+    <arg name="model"     value="$(find uav_bushfire)/urdf/quadrotor_laser_mast.gazebo.xacro" />
+    <arg name="x"         value="$(arg x)" />
+    <arg name="y"         value="$(arg y)" />
+    <arg name="z"         value="$(arg z)" />
+  </include>
+
+  <!-- Off, and in this scenario it is not close to optional. auto_engage cuts
+       the motors when it sees a commanded descent that is not being achieved,
+       which is landing detection - and the DESCEND phase is a commanded
+       descent onto the ground, held there. fire_suppressor calls /engage once
+       instead, and /shutdown deliberately during a respawn. -->
+  <param name="controller/twist/auto_engage" value="false" type="bool" />
+
+
+  <node pkg="uav_scout_bushfire" type="fire_suppressor" name="fire_suppressor"
+        output="screen"
+        launch-prefix="bash -c 'sleep 14 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <!-- This drone's transit lane: cruise_altitude for lane 0, plus
+         cruise_step for each lane above it. Separating the aircraft where they
+         *fly* rather than only where they stop - see the suppressor. -->
+    <param name="cruise_altitude" value="$(arg cruise_altitude)" />
+    <param name="cruise_step"     value="$(arg cruise_step)" />
+    <!-- Only a fallback now: the spotter sends a station with every tasking,
+         including its altitude, because crew members are stacked. This is what
+         a lone drone's station comes out at, and what is used if a tasking
+         ever arrives without one. Must stay comfortably under the spotter's
+         suppress_altitude, or the drone hovers above the threshold and never
+         registers as bombing. -->
+    <param name="drop_altitude"   value="$(arg drop_altitude)" />
+    <!-- Do not bid on a fire that already has this many drones on it. The
+         spotter enforces the same cap; this only saves a claim that would be
+         refused, and keeps the drone's own share arithmetic honest. -->
+    <param name="max_crew"        value="$(arg max_crew)" />
+    <!-- Nor one already this far through its work. Both caps are mirrored from
+         the spotter, which is the one that actually enforces them; having them
+         here as well only saves a claim that would be refused, and keeps the
+         drone's own share arithmetic from preferring a fire it cannot have. -->
+    <param name="join_deadline"   value="$(arg join_deadline)" />
+    <!-- Water. Below reserve the drone tops up before bidding on anything -
+         arriving at somebody's fire with two seconds in the tank helps nobody
+         and spends a whole transit doing it. At dry it breaks off wherever it
+         is, keeping whatever fire it holds. -->
+    <param name="reserve_litres"  value="$(arg reserve_litres)" />
+    <param name="dry_litres"      value="0.4" />
+    <param name="full_fraction"   value="0.97" />
+    <!-- Where it sits while taking water. Inside the controller's own refill
+         band with margin, and clear of the tender's visibility pole, which
+         tops out at 0.75 m - that pole is what makes one Scout visible to
+         another's costmap, so it is not going away and the aircraft has to fly
+         over it. 1.25 m leaves half a metre. -->
+    <param name="refill_altitude" value="1.25" />
+    <!-- Tighter than the controller's refill_radius (0.90), so the drone is
+         comfortably inside the transfer zone rather than on its edge. -->
+    <param name="refill_radius"   value="0.45" />
+    <!-- Where this drone waits its turn for a tender. A tender is a single
+         point and three drones want it, so they queue on a ring at cruise
+         instead of all station-keeping on the same spot - measured at 0.20 m
+         between two of them before this existed, with rotor tips 0.396 m out.
+         Numbered slots rather than anything derived from the namespace: uav_0,
+         uav_1 and uav_2 hash to bearings three centimetres apart. -->
+    <param name="hold_radius"     value="2.00" />
+    <rosparam param="peers" subst_value="true">$(arg peers)</rosparam>
+    <param name="value_first"     value="$(arg value_first)" />
+    <param name="peer_radius"     value="$(arg peer_radius)" />
+    <param name="peer_vsep"       value="$(arg peer_vsep)" />
+    <param name="peer_push"       value="$(arg peer_push)" />
+    <param name="hold_index"      value="$(arg hold_index)" />
+    <param name="hold_count"      value="$(arg hold_count)" />
+    <!-- ...and stacked as well as spread. The ring separates where the drones
+         stop; this separates them on the way in, where a straight line to a
+         slot can pass right over the tender and over whoever is descending
+         onto it. 0.40 m a slot is more than a rotor span. -->
+    <!-- Zero: the cruise lanes above already stack the three aircraft, and
+         adding a second offset on top would push lane 2 through the tree
+         tops on its way to a tender. -->
+    <param name="hold_altitude_step" value="0.0" />
+    <!-- How often the board is re-read and a choice made. Twice a second is
+         plenty: the decision is only taken when the drone owes nobody
+         anything, and it is binding once accepted. -->
+    <param name="choose_hz"       value="2.0" />
+    <!-- A claim can be refused - the crew filled up while the board was in
+         flight - and nothing answers it directly, so it is re-sent until a
+         tasking comes back and re-decided after this long. -->
+    <param name="claim_timeout"   value="3.0" />
+    <!-- ...and in the other direction, taskings arriving at 10 Hz are what
+         prove the commitment still stands. Silence for this long means the
+         spotter has taken the fire back (its commit_timeout), and the drone
+         should stop flying at something that is no longer its. -->
+    <param name="target_timeout"  value="2.0" />
+    <!-- The floor for every commanded altitude. The laser is horizontal and
+         sees nothing below the aircraft, so this number is the only thing
+         between a descent and the ground. -->
+    <param name="min_altitude"    value="0.7" />
+    <param name="linear_speed"    value="$(arg linear_speed)" />
+    <param name="vertical_speed"  value="0.6" />
+    <param name="arrive_radius"   value="$(arg arrive_radius)" />
+    <param name="climb_tol"       value="0.20" />
+    <!-- Station-keeping over the fire. Gentle on purpose: this is the one
+         phase that commands lateral velocity, and a drone that darts sideways
+         at low level near trees is a drone about to be respawned. -->
+    <param name="station_gain"    value="1.2" />
+    <param name="station_speed"   value="0.6" />
+    <param name="angular_gain"    value="$(arg angular_gain)" />
+    <param name="max_angular"     value="1.5" />
+    <param name="angle_tol"       value="0.12" />
+    <param name="slow_dist"       value="1.0" />
+    <param name="avoid_dist"      value="$(arg avoid_dist)" />
+    <param name="stop_dist"       value="$(arg stop_dist)" />
+    <!-- The scan is trusted down to the sensor's own floor, because a trunk
+         the drone is already touching reads at 0.33 m and must not be filtered
+         away. Self-hits off the rotors are rejected by tilt instead: past
+         self_hit_tilt the mast no longer holds the scan plane above the rotor
+         discs, and only then is anything inside self_hit_range dropped. -->
+    <param name="min_valid_range" value="0.15" />
+    <param name="self_hit_range"  value="0.50" />
+    <param name="self_hit_tilt"   value="0.50" />
+    <!-- Reverse out when fully blocked, rather than only spinning: a drone
+         pinned against a trunk has no clear heading to turn to. -->
+    <param name="back_off_speed"  value="0.35" />
+    <!-- Commit to a deflection for a moment after the front sector clears.
+         Without it the drone re-aims the instant it is past, turns back into
+         the tree and never gets by - see the suppressor's CHASE branch. -->
+    <param name="avoid_hold"      value="1.5" />
+    <!-- Geofence, scaled to the 20 x 20 arena. Soft at 8.8 turns the drone
+         round with 1.1 m still between it and the firebreak face at 9.9 - enough to stop in from cruise; past
+         the hard limit, or tilted past upset_angle, it is respawned at its
+         launch point. Necessary because auto_engage:=false above also disables
+         hector's flip-over motor cut - see the suppressor's header. -->
+    <param name="fence_half_size" value="8.8" />
+    <param name="fence_hard_size" value="12.5" />
+    <param name="fence_max_alt"   value="4.0" />
+    <param name="upset_angle"     value="1.05" />
+    <param name="settle_time"     value="1.5" />
+    <param name="start_x"         value="$(arg x)" />
+    <param name="start_y"         value="$(arg y)" />
+    <param name="control_hz"      value="20.0" />
+    <param name="status_hz"       value="1.0" />
+  </node>
+
+</launch>

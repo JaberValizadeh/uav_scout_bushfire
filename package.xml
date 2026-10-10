@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>uav_scout_bushfire</name>
+  <version>1.0.0</version>
+  <description>
+    Three hector quadrotors and two AgileX Scout V2 ground robots fighting a
+    bushfire together. The drones bomb the fires and the scouts are the water
+    tenders: a drone carries only a few seconds of water and has to fly to a
+    scout to reload, and a scout has to drive to the dam to reload itself.
+    Neither fleet can work the fire ground on its own.
+  </description>
+
+  <maintainer email="valizadeh.au@gmail.com">Jaber</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf</depend>
+  <depend>gazebo_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <!-- The fire ground itself. This package reuses uav_bushfire's Hotspot,
+       HotspotArray and FireClaim messages, its world, and the quadrotor's
+       laser-mast description; the scenario here is that package's plus water.
+       Forking those would have meant two copies of a message set that has to
+       agree, for no benefit. -->
+  <depend>uav_bushfire</depend>
+
+  <!-- The ground robots. scout_description is the airframe; scout_gazebo is
+       the ros_control configuration and the skid-steer node that turns
+       /cmd_vel into four wheel velocities, both of which live in ~/scout_ws.
+       Note these are exec dependencies only - nothing here builds against
+       them - which matters because ~/scout_ws is a separate workspace reached
+       by a path fix rather than by the build chain. See setup_coop.bash. -->
+  <exec_depend>scout_description</exec_depend>
+  <exec_depend>scout_gazebo</exec_depend>
+
+  <exec_depend>hector_quadrotor_gazebo</exec_depend>
+  <exec_depend>hector_sensors_description</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>velocity_controllers</exec_depend>
+  <exec_depend>joint_state_controller</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>rviz</exec_depend>
+
+  <!-- The navigation stack, for the tenders' path planning. Not installed by
+       default on this machine:
+           sudo apt install ros-noetic-navigation ros-noetic-gmapping
+       With nav:=false the package runs without any of it - water_tender falls
+       back to the reactive laser controller it had before move_base was an
+       option - which is why these are exec dependencies rather than build
+       ones and why nothing here fails to compile without them. -->
+  <exec_depend>move_base</exec_depend>
+  <exec_depend>map_server</exec_depend>
+  <exec_depend>dwa_local_planner</exec_depend>
+  <exec_depend>global_planner</exec_depend>
+  <exec_depend>costmap_2d</exec_depend>
+  <exec_depend>gmapping</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+</package>

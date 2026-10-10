@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!-- Drive a map of the fire ground with gmapping, if you would rather have one
+     surveyed than generated.
+
+     maps/bushfire_big.pgm is generated from the same numbers that build
+     worlds/bushfire_big.world, which is deliberate: the two can then never
+     disagree, and a map that disagrees with the world is a robot planning
+     confidently through a tree. But a generated map is also a slightly
+     dishonest one - it is perfect, and a surveyed map is not - so this exists
+     for when the point is the mapping rather than the fire.
+
+     Usage:
+       roslaunch uav_scout_bushfire bushfire_coop.launch nav:=false
+       roslaunch uav_scout_bushfire build_map.launch ns:=scout_0
+       # drive it around: rostopic pub /scout_0/cmd_vel ... or teleop
+       rosrun map_server map_saver -f ~/my_map map:=/map
+
+     nav:=false on the first line because gmapping publishes map -> odom itself
+     and would fight the static transform scout_navigation.launch publishes.
+-->
+<launch>
+  <arg name="ns" default="scout_0" doc="which Scout does the surveying" />
+
+  <group ns="$(arg ns)">
+    <node pkg="gmapping" type="slam_gmapping" name="slam_gmapping" output="screen">
+      <remap from="scan" to="scan" />
+      <param name="odom_frame"  value="$(arg ns)/odom" />
+      <param name="base_frame"  value="$(arg ns)/base_link" />
+      <param name="map_frame"   value="map" />
+      <param name="map_update_interval" value="2.0" />
+      <!-- The Hokuyo on the mast reaches 30 m and the arena is 20 m across, so
+           there is no reason to cut it short. -->
+      <param name="maxUrange"   value="18.0" />
+      <param name="maxRange"    value="30.0" />
+      <param name="delta"       value="0.05" />
+      <param name="particles"   value="30" />
+      <!-- The trunks are 0.70 m across and the gaps between them are metres, so
+           the default update thresholds are far too eager for this scene. -->
+      <param name="linearUpdate"  value="0.5" />
+      <param name="angularUpdate" value="0.4" />
+      <param name="xmin" value="-11.0" /><param name="xmax" value="11.0" />
+      <param name="ymin" value="-11.0" /><param name="ymax" value="11.0" />
+    </node>
+  </group>
+</launch>

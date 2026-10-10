@@ -1,0 +1,1189 @@
+#!/usr/bin/env python3
+"""
+water_tender - drives one Scout V2 as a mobile water point for the drones.
+
+The ground half of the cooperation. A drone carries about ten seconds of
+bombing; this vehicle carries about six drone loads and the dam carries the
+rest, so the fire ground is only workable if somebody keeps driving water
+towards the aircraft. That is this node's whole job, and it comes down to one
+question asked over and over: *where should I be standing right now?*
+
+Algorithm
+---------
+  DAM     - drive to this tender's docking slot at the dam and fill up. Entered
+            whenever the load drops below ~reserve_litres, and on startup,
+            because a tender that runs dry among the fires is worse than
+            useless - the drones are already committed to flying at it.
+  STAND   - hold position and dispense. This is the productive state and the
+            one the vehicle should spend most of its time in.
+  DRIVE   - get to wherever STAND is supposed to happen.
+
+Choosing where to stand
+-----------------------
+The board says which fires are burning and how many drones are on each. A fire
+with a crew is a place where aircraft are spending water, so the tender scores
+every crewed fire by
+
+    crew on it / (seconds to drive there + a constant)
+
+and parks at ~standoff from the best one. The constant stops a fire the vehicle
+is already sitting next to from scoring infinitely; the drive time is in the
+denominator because a tender in transit is dispensing nothing.
+
+It stands *beside* the fire rather than on it, on the side facing the middle of
+the arena. Both parts matter. A tender parked on the fire would be under the
+crew ring, which is where three aircraft are descending to 0.95 m; and offset
+towards the middle keeps it out of the approach lane, since drones arrive from
+wherever their last job was and the middle is where most of them come from.
+
+Why it does not follow the thirstiest drone
+-------------------------------------------
+That was the obvious rule and it is worse. A drone low on water is about to
+leave its fire, so chasing it means driving towards a position it is in the act
+of vacating; two tenders both chasing the same aircraft is the same failure
+twice. Standing where the *work* is means the tender is already in the right
+place when a drone runs dry, which is the only moment its position matters.
+
+Keeping two tenders apart
+-------------------------
+Each publishes the point it intends to stand at on /bushfire/tenders, and a
+tender whose best option is within ~tender_separation of a peer's claim takes
+its second choice instead. Same protocol as the drones' fire claims, minus the
+ledger: standing somewhere is not a resource that has to be granted, so nothing
+accepts or refuses this - it is published purely so the other one can hear it.
+
+Two qualifications on that, both of which exist because the first version of it
+deadlocked - see _peer_blocks(). Idle claims do not block, or two tenders with
+nothing to do reserve the middle of the arena and then refuse every real option
+they are subsequently offered; and only a lower-sorting namespace blocks, or the
+yielding is symmetric and both give way to a spot neither is now taking.
+
+The dam is the exception, because there is only one and both will need it. That
+is handled by geometry instead: numbered docking slots on a ring around it,
+~dock_index of ~dock_count, the same answer as a fire's crew stations.
+
+Driving
+-------
+move_base, over a map shared by every Scout. This node decides *where* a water
+point should be - the only part of it that is about the scenario - and sends
+that as a goal; the navigation stack plans the route, follows it, and avoids
+whatever the static map does not know about, which here means the other tender.
+
+That is a real change in kind rather than a better controller. The reactive
+version below could only ever steer at the goal and swerve when something got
+close, so a fire in a concave pocket of timber, or one behind the dam, was a
+place this vehicle simply could not reach: it would drive at the obstruction,
+deflect, re-aim and drive at it again. A global planner routes round the whole
+obstacle because it can see the whole obstacle.
+
+If the navigation stack is not installed the node says so and falls back to the
+reactive controller, which is the original: turn until roughly pointed at the
+goal, then drive forward with proportional steering, filtered through the same
+three laser sectors the aircraft use. It still works; it just cannot plan.
+
+The Scout is skid-steer either way, which shows up twice. It cannot strafe, so
+every repositioning is a turn followed by a drive - there is no equivalent of
+the drones' station-keeping. And it scrubs when it turns, so ~angle_tol is
+looser than an aircraft's: chasing a heading to a tighter tolerance than the
+vehicle can hold just grinds the wheels.
+
+Fire, which it cannot see either
+--------------------------------
+The flames are spawned with no collision at all - deliberately, so an aircraft
+can fly down into one - so they return nothing to the Hokuyo. Neither the laser
+filter nor a costmap has anything to say about fire, and before this the vehicle
+would drive the length of a burning fire at cruise speed without slowing.
+
+So fire is handled from the board rather than from the sensor, in four parts,
+and which of them apply depends on who is driving:
+
+  reactive only
+    it does not aim across one   _fire_detour() searches headings fanning out
+                                 from the goal bearing until one stays clear of
+                                 *every* fire, and holds the side it picked
+    it slows near one            _fire_speed_cap() creeps inside ~fire_caution
+
+  move_base
+    the planner routes round it  scripts/fire_costmap publishes the fire board
+                                 as a PointCloud2 obstacle source, so a fire is
+                                 an obstacle to the global planner like a tree
+
+  both
+    it backs out of one          _drive_out_of_fire(), called before the
+                                 move_base handover, because a fire can light on
+                                 top of a tender standing exactly where it
+                                 should be
+
+The split matters and getting it wrong is silent. Everything below the handover
+in _control_loop is move_base's job and does not run, so the first two are off
+whenever ~nav is true - turning the navigation stack on removed this node's
+whole fire avoidance and the tenders went straight back to driving through
+fires, correctly, because nothing had told the planner. That is what
+fire_costmap is for, and it is why the escape was moved above the handover.
+
+Measured on the reactive path: every remaining breach was a fire igniting
+within a second onto a vehicle doing 0.00-0.25 m/s.
+
+What it cannot see
+------------------
+The drones, which is deliberate - the scan plane is at 0.50 m and they cruise
+at 2.0 m, coming no lower than 1.25 m over a tender. The costmap's
+max_obstacle_height sits between the two, so an aircraft hovering overhead to
+take water is not an obstacle to brake for. See scout_v2_laser.urdf.xacro.
+
+It *can* see the other Scout, which it could not before, and that is what the
+visibility pole on each vehicle is for: their decks are below this scan plane,
+so without a pole rising through it each tender is a hole in the other's
+costmap. move_base plans through holes.
+
+Subscriptions
+-------------
+  odom                    nav_msgs/Odometry               this scout's pose
+  scan                    sensor_msgs/LaserScan           Hokuyo on the boom
+  /bushfire/water         uav_scout_bushfire/WaterBoard   tanks and the dam
+  /bushfire/hotspots      uav_bushfire/HotspotArray       where the work is
+  /bushfire/tenders       uav_scout_bushfire/TenderClaim  the other scout
+
+Publications
+------------
+  cmd_vel                 geometry_msgs/Twist             body-frame drive
+  /bushfire/tenders       uav_scout_bushfire/TenderClaim  where I am standing
+
+ROS Parameters (private, ~)
+---------------------------
+  ~linear_speed      float  Cruise speed, m/s                  (default 0.9)
+  ~angular_gain      float  Heading P-gain                     (default 1.6)
+  ~max_angular       float  Yaw rate cap, rad/s                (default 1.2)
+  ~angle_tol         float  Heading tolerance, rad             (default 0.20)
+  ~arrive_radius     float  Close enough to stand, m           (default 0.35)
+  ~slow_dist         float  Begin slowing at this range, m     (default 1.5)
+  ~standoff          float  Park this far from a fire, m       (default 2.0)
+  ~reserve_litres    float  Go to the dam below this           (default 45.0)
+  ~full_litres       float  Leave the dam above this           (default 235.0)
+  ~dock_radius       float  Docking ring radius at the dam, m  (default 1.30)
+  ~dock_index        int    Which slot on that ring is mine    (default 0)
+  ~dock_count        int    How many slots the ring has        (default 2)
+  ~dock_spread       float  Angular spread of the dock slots
+                            about the bearing to the arena, rad(default 1.20)
+  ~stuck_time        float  Declare stuck after this long
+                            without moving, s (reactive only)  (default 6.0)
+  ~stuck_dist        float  ...having moved less than this, m  (default 0.15)
+  ~escape_time       float  Reverse and turn for this long, s  (default 2.5)
+  ~obstacles         list   [[x, y, radius], ...] the trees, so
+                            a standing point never puts a
+                            queueing drone inside one          (default [])
+  ~flame_scale       float  MUST match the incident controller's;
+                            a fire's radius is derived from it   (default 1.0)
+  ~fire_margin       float  Added to the flame radius to give
+                            the keep-out, m                      (default 0.60)
+  ~fire_caution      float  Band beyond the keep-out where it
+                            eases off, m                         (default 1.50)
+  ~fire_creep_speed  float  Speed inside that band, m/s          (default 0.30)
+  ~fire_lookahead    float  How far a candidate heading must
+                            stay clear of fire, m                (default 4.0)
+  ~fire_pass_buffer  float  Margin a heading must clear the
+                            keep-out by, m                       (default 0.25)
+  ~drone_hold_radius float  The ring drones queue on above a
+                            tender, m                          (default 2.0)
+  ~rotor_radius      float  A drone's rotor disc, m            (default 0.40)
+  ~tender_separation float  Keep standing points this far
+                            apart, m                           (default 3.0)
+  ~repick_period     float  Re-examine the standing choice at
+                            most this often, s                 (default 4.0)
+  ~avoid_dist        float  Avoidance activation range, m      (default 1.4)
+  ~stop_dist         float  Full-stop obstacle range, m        (default 0.7)
+  ~min_valid_range   float  Sensor floor; drop returns below   (default 0.10)
+  ~back_off_speed    float  Reverse speed when blocked, m/s    (default 0.25)
+  ~avoid_hold        float  Commit to a deflection this long
+                            after it clears, s                 (default 1.2)
+  ~fence_half_size   float  Stay inside this half-width, m     (default 5.4)
+  ~use_move_base     bool   Plan with move_base rather than the
+                            built-in reactive controller       (default true)
+  ~control_hz        float  Control loop rate, Hz              (default 20.0)
+  ~status_hz         float  Status display rate, Hz            (default 1.0)
+"""
+
+import math
+
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+from uav_bushfire.msg import HotspotArray
+from uav_scout_bushfire.msg import WaterBoard, TenderClaim
+
+# The navigation stack is optional. Without it this node drives itself with the
+# reactive controller further down, which is what it did before move_base was
+# an option and is still the fallback if the packages are not installed - so
+# the import is allowed to fail rather than taking the whole tender with it.
+try:
+    import actionlib
+    from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+    from actionlib_msgs.msg import GoalStatus
+    _HAVE_MOVE_BASE = True
+except ImportError:                                       # pragma: no cover
+    _HAVE_MOVE_BASE = False
+
+_RESET  = '\033[0m'
+_BOLD   = '\033[1m'
+_YELLOW = '\033[93m'
+_GREEN  = '\033[92m'
+_CYAN   = '\033[96m'
+_RED    = '\033[91m'
+_BLUE   = '\033[94m'
+_WHITE  = '\033[97m'
+
+
+def _normalize_angle(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class WaterTender(object):
+
+    def __init__(self):
+        rospy.init_node('water_tender', anonymous=False)
+
+        self._ns = rospy.get_namespace().strip('/') or 'scout'
+
+        self._lin_speed  = rospy.get_param('~linear_speed', 0.9)
+        self._ang_gain   = rospy.get_param('~angular_gain', 1.6)
+        self._max_ang    = rospy.get_param('~max_angular', 1.2)
+        self._angle_tol  = rospy.get_param('~angle_tol', 0.20)
+        self._arrive_rad = rospy.get_param('~arrive_radius', 0.35)
+        self._slow_dist  = rospy.get_param('~slow_dist', 1.5)
+        self._standoff   = rospy.get_param('~standoff', 2.0)
+        self._reserve    = rospy.get_param('~reserve_litres', 45.0)
+        self._full       = rospy.get_param('~full_litres', 235.0)
+        self._dock_rad   = rospy.get_param('~dock_radius', 1.30)
+        self._dock_i     = int(rospy.get_param('~dock_index', 0))
+        self._dock_n     = int(rospy.get_param('~dock_count', 2))
+        self._dock_spread = rospy.get_param('~dock_spread', 1.20)
+        self._stuck_time = rospy.get_param('~stuck_time', 6.0)
+        self._stuck_dist = rospy.get_param('~stuck_dist', 0.15)
+        self._escape_time = rospy.get_param('~escape_time', 2.5)
+        # Where the trees are. This node cannot see them far enough ahead to
+        # choose by laser - it has to reject a standing point before driving to
+        # it - so it is told, from the same list the incident controller gets.
+        self._obstacles  = rospy.get_param('~obstacles', [])
+        self._drone_ring = rospy.get_param('~drone_hold_radius', 2.0)
+
+        # Fire, which this vehicle is blind to. The flames are spawned with no
+        # collision at all - deliberately, so an aircraft can fly down into one
+        # - which means they return nothing to the Hokuyo and the three-sector
+        # filter below will happily drive the length of a burning fire without
+        # slowing. Every fire this node keeps away from, it keeps away from
+        # because the board told it where they are, not because it saw one.
+        self._flame_scale = rospy.get_param('~flame_scale', 1.0)
+        self._fire_margin = rospy.get_param('~fire_margin', 0.60)
+        self._fire_caution = rospy.get_param('~fire_caution', 1.50)
+        self._fire_creep = rospy.get_param('~fire_creep_speed', 0.30)
+        # How far ahead a candidate heading has to stay clear. Long
+        # enough to commit to going round a fire, short enough that a
+        # fire beyond the goal does not veto the approach to it.
+        self._fire_look = rospy.get_param('~fire_lookahead', 4.0)
+        self._fire_pass = rospy.get_param('~fire_pass_buffer', 0.25)
+        self._rotor      = rospy.get_param('~rotor_radius', 0.40)
+        self._tender_sep = rospy.get_param('~tender_separation', 3.0)
+        self._repick     = rospy.get_param('~repick_period', 4.0)
+        self._avoid_dist = rospy.get_param('~avoid_dist', 1.4)
+        self._stop_dist  = rospy.get_param('~stop_dist', 0.7)
+        self._min_range  = rospy.get_param('~min_valid_range', 0.10)
+        self._back_off   = rospy.get_param('~back_off_speed', 0.25)
+        self._avoid_hold = rospy.get_param('~avoid_hold', 1.2)
+        self._fence      = rospy.get_param('~fence_half_size', 5.4)
+        control_hz       = rospy.get_param('~control_hz', 20.0)
+        status_hz        = rospy.get_param('~status_hz', 1.0)
+
+        self._x = self._y = self._yaw = 0.0
+        self._odom_ready = False
+
+        self._scan = None
+        self._avoiding = False
+        self._avoid_until = rospy.Time(0)
+        # Latch, so easing off beside a fire is logged once rather than at the
+        # 20 Hz the control loop runs at.
+        self._fire_warned = False
+        # The side of a fire currently being passed on, held for ~avoid_hold so
+        # the choice cannot oscillate. See _fire_detour().
+        self._detour_side = None
+        self._detour_fire = -1
+        self._detour_until = rospy.Time(0)
+        # Latch for the retreat warning, same reason as _fire_warned.
+        self._retreating = False
+
+        self._litres = 0.0
+        self._capacity = 1.0
+        self._dam = None                  # (x, y, radius)
+        self._board = []                  # fires
+        self._peer_points = {}            # other scout -> (x, y, when)
+
+        self._state = 'DAM'
+        self._goal = None                 # (x, y)
+        # Stuck detection, for the reactive path only - move_base has recovery
+        # behaviours of its own and this would fight them.
+        self._moved_at = rospy.Time(0)
+        self._moved_from = None
+        self._escape_until = rospy.Time(0)
+        self._escape_turn = 1.0
+        self._goal_fire = -1
+        self._picked_at = rospy.Time(0)
+        self._delivered_seen = 0.0
+
+        rospy.Subscriber('odom', Odometry, self._odom_cb)
+        rospy.Subscriber('scan', LaserScan, self._scan_cb)
+        rospy.Subscriber('/bushfire/water', WaterBoard, self._water_cb)
+        rospy.Subscriber('/bushfire/hotspots', HotspotArray, self._fires_cb)
+        rospy.Subscriber('/bushfire/tenders', TenderClaim, self._peer_cb)
+
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self._claim_pub = rospy.Publisher('/bushfire/tenders', TenderClaim,
+                                          queue_size=10)
+
+        # ---- move_base, if it is there ----------------------------------
+        self._nav = None
+        self._nav_goal = None          # the point currently sent as a goal
+        want_nav = rospy.get_param('~use_move_base', True)
+        if want_nav and not _HAVE_MOVE_BASE:
+            rospy.logwarn('[%s] ~use_move_base is set but the navigation stack '
+                          'is not installed (no move_base_msgs) - falling back '
+                          'to the reactive controller. '
+                          'sudo apt install ros-noetic-navigation', self._ns)
+        elif want_nav:
+            self._nav = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+            rospy.loginfo('[%s] waiting for move_base...', self._ns)
+            if self._nav.wait_for_server(rospy.Duration(30.0)):
+                rospy.loginfo('[%s] move_base is up - planning on the shared map',
+                              self._ns)
+            else:
+                rospy.logwarn('[%s] move_base never came up - falling back to '
+                              'the reactive controller', self._ns)
+                self._nav = None
+
+        rospy.Timer(rospy.Duration(1.0 / control_hz), self._control_loop)
+        rospy.Timer(rospy.Duration(1.0 / status_hz), self._status_display)
+
+        self._print_header()
+
+    # ----------------------------------------------------------- display ---
+    def _print_header(self):
+        print(flush=True)
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET, flush=True)
+        print(_BOLD + _WHITE + '|   WATER TENDER  -  %-29s |' % self._ns + _RESET, flush=True)
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET, flush=True)
+        print('  %sstandoff%s = %.2f m    %sreserve%s = %.0f L    %sdock%s = %d/%d'
+              % (_CYAN, _RESET, self._standoff, _CYAN, _RESET, self._reserve,
+                 _CYAN, _RESET, self._dock_i, self._dock_n), flush=True)
+        print(flush=True)
+
+    def _status_display(self, _event):
+        if not self._odom_ready:
+            return
+        col = {'DAM': _BLUE, 'DRIVE': _CYAN, 'STAND': _GREEN}.get(self._state,
+                                                                  _WHITE)
+        avoid = ' %s[AVOID]%s' % (_RED, _RESET) if self._avoiding else ''
+        pct = 100.0 * self._litres / max(self._capacity, 1e-6)
+        goal = ('(%5.2f,%5.2f)' % self._goal) if self._goal else '   -----   '
+        by = ('fire %d' % self._goal_fire) if self._goal_fire >= 0 else 'the dam'
+        print('  [%s] [%s%-5s%s]%s pos=(%6.2f,%6.2f) goal=%s by %-7s '
+              'water=%s%s%5.0f L%s (%3.0f%%) given=%.0f L'
+              % (self._ns, col, self._state, _RESET, avoid, self._x, self._y,
+                 goal, by, _YELLOW, _BOLD, self._litres, _RESET, pct,
+                 self._delivered_seen), flush=True)
+
+    # --------------------------------------------------------- callbacks ---
+    def _odom_cb(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        self._x, self._y = p.x, p.y
+        _, _, self._yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._odom_ready = True
+
+    def _scan_cb(self, msg):
+        self._scan = msg
+
+    def _fires_cb(self, msg):
+        self._board = msg.hotspots
+
+    def _water_cb(self, msg):
+        self._dam = (msg.dam_x, msg.dam_y, msg.dam_radius)
+        for tank in msg.tanks:
+            if tank.vehicle == self._ns:
+                self._litres = tank.litres
+                self._capacity = tank.capacity
+                return
+
+    def _peer_cb(self, msg):
+        if msg.scout == self._ns:
+            return
+        self._peer_points[msg.scout] = (msg.x, msg.y, msg.fire_id,
+                                        rospy.Time.now())
+
+    # -------------------------------------------------------- the choice ---
+    def _peer_blocks(self, x, y):
+        """Has a tender with priority already said it is standing about here?
+
+        Two rules, and both were put here by watching the thing deadlock.
+
+        Only *working* claims block. A tender with nothing to do waits at the
+        idle point and publishes that as a claim like any other, and the first
+        version let those block too. Both scouts then published the same idle
+        point, and every real standing option - which is inside the timber,
+        within a few metres of the middle - was inside tender_separation of the
+        other one's idle claim. So each refused every candidate it had because
+        the other one was standing still, and both sat at the centre, 0.69 m
+        apart, while three fires burned with crews on them. Idle claims carry
+        fire_id < 0 and are ignored here.
+
+        And only *lower-sorting* peers block. Without a tiebreak the yielding
+        is symmetric: both compute at the same tick, both pick the same best
+        point, both hear the other, and both move away from a spot neither is
+        now taking. A fixed priority by namespace makes exactly one of them
+        give way.
+
+        Claims older than a few seconds are ignored either way, so a scout that
+        dies does not reserve a patch of the fire ground for the rest of the
+        run.
+        """
+        now = rospy.Time.now()
+        for scout, (px, py, fire_id, when) in self._peer_points.items():
+            if (now - when).to_sec() > 3.0:
+                continue
+            if fire_id < 0:
+                continue
+            if scout > self._ns:
+                continue
+            if math.hypot(x - px, y - py) < self._tender_sep:
+                return True
+        return False
+
+    def _idle_point(self):
+        """Where to wait when nothing is crewed anywhere.
+
+        The middle of the arena, because it is the shortest average drive to
+        wherever work next appears - but offset by docking slot, or the two
+        tenders wait on the same square metre and the only thing keeping them
+        apart is that neither is moving.
+        """
+        if self._dock_n <= 1:
+            return (0.0, 0.0)
+        theta = 2.0 * math.pi * self._dock_i / float(self._dock_n)
+        return (1.6 * math.cos(theta), 1.6 * math.sin(theta))
+
+    def _clear_of_trees(self, x, y):
+        """Is this a place a tender can stand without putting aircraft in a tree?
+
+        The clearance is not about this vehicle fitting - it is about what
+        happens *above* it. Drones queueing for water hold a ring of
+        ~drone_hold_radius around the tender, so a tender parked a metre from a
+        trunk puts one of those holding slots inside the tree.
+
+        Measured before this existed: a tender stood beside the trunk at
+        (-4.38, 4.38) and the drones waiting on its ring spent 51 samples with
+        their rotor discs 0.16-0.18 m inside the bark, with the laser avoidance
+        engaged the whole time and unable to help - station-keeping commands
+        lateral velocity, and the three-sector filter only shapes forward speed
+        and yaw.
+        """
+        need = self._drone_ring + self._rotor
+        for obs in self._obstacles:
+            ox, oy, orad = obs[0], obs[1], obs[2]
+            if math.hypot(x - ox, y - oy) < orad + need:
+                return False
+        return True
+
+    # ------------------------------------------------------------- fire ----
+    def _fire_radius(self, intensity):
+        """How wide this fire actually burns, in metres.
+
+        The same expression the incident controller sizes the flame model with,
+        so the circle this vehicle keeps out of and the fire a viewer can see
+        are the same object. Hard-coding a constant here would have been one
+        number in two files with nothing to keep them equal, and the way that
+        fails is a tender driving through the visible edge of a 10 because the
+        constant was written for a 1.
+        """
+        i = max(1.0, min(10.0, intensity))
+        return self._flame_scale * (0.62 + 0.081 * (i - 1.0))
+
+    def _fire_keepout(self, fire):
+        """The radius this vehicle must not enter, burning fires only."""
+        return self._fire_radius(fire.intensity) + self._fire_margin
+
+    def _live_fires(self):
+        """Fires that are actually alight.
+
+        Every fire on the board already is: the incident controller publishes
+        burning slots only and drops a fire from the array the moment it is put
+        out, deleting its Gazebo model with it. So this is the whole board, and
+        it exists as a named method so the two uses below say what they mean
+        rather than reading self._board and leaving the reader to check.
+        """
+        return self._board
+
+    def _drive_out_of_fire(self, inside, cmd):
+        """Turn away from the fire and drive off it.
+
+        Turn-and-drive rather than reverse: reversing is quicker but points the
+        laser away from where the vehicle is going, and there is timber round
+        these fires. The safety filter is told which fire is being escaped so
+        its own reverse-out-of-trouble branch cannot undo the escape.
+        """
+        f, depth = inside
+        if not self._retreating:
+            rospy.logwarn('[%s] fire %d (intensity %.0f) has lit %.2f m '
+                          'inside my keep-out - backing out',
+                          self._ns, f.id, f.intensity, depth)
+            self._retreating = True
+        ax = self._x - f.x
+        ay = self._y - f.y
+        want = math.atan2(ay, ax)
+        err = _normalize_angle(want - self._yaw)
+        cmd.angular.z = _clamp(self._ang_gain * err,
+                               -self._max_ang, self._max_ang)
+        if abs(err) < self._angle_tol * 2.0:
+            cmd.linear.x = self._fire_creep * 2.0
+        self._cmd_pub.publish(self._safety_filter(cmd, away_from=(f.x, f.y)))
+        # Force a fresh decision once clear, so it does not drive straight back
+        # to a stand point that is now inside a fire.
+        self._state = 'DRIVE'
+        self._goal = None
+
+    def _inside_fire(self):
+        """The fire this vehicle is standing in, and how far in, or None.
+
+        Deepest first, because with two overlapping keep-outs backing out of
+        the shallower one can drive further into the other.
+        """
+        worst = None
+        for f in self._live_fires():
+            depth = self._fire_keepout(f) - math.hypot(self._x - f.x,
+                                                       self._y - f.y)
+            if depth <= 0.0:
+                continue
+            if worst is None or depth > worst[1]:
+                worst = (f, depth)
+        return worst
+
+    def _fire_speed_cap(self, x, y):
+        """Speed limit at this point, and the fire that imposes it.
+
+        Inside the keep-out the vehicle is in the fire and the only correct
+        speed is the one that gets it out; between there and ~fire_caution it
+        creeps. This is the "take care near fire" half - the detour below keeps
+        it from crossing one at all, but a tender standing beside a 10 is
+        working two metres from open flame and should not be doing 0.9 m/s.
+        """
+        cap, worst = None, None
+        for f in self._live_fires():
+            d = math.hypot(x - f.x, y - f.y)
+            keep = self._fire_keepout(f)
+            if d >= keep + self._fire_caution:
+                continue
+            if d <= keep:
+                lim = self._fire_creep
+            else:
+                # Linear from creep speed at the keep-out edge to full speed at
+                # the outside of the caution band.
+                t = (d - keep) / max(self._fire_caution, 1e-3)
+                lim = self._fire_creep + t * (self._lin_speed - self._fire_creep)
+            if cap is None or lim < cap:
+                cap, worst = lim, f
+        return cap, worst
+
+    def _heading_clear(self, theta, reach):
+        """Does a straight run along this heading stay out of every fire?
+
+        Checked against all of them, which is the thing the first version of
+        this got wrong. Steering to the tangent of the single worst fire is a
+        decision made in ignorance of the others, and two fires in a row is
+        enough to break it: the side chosen to miss the first drove the vehicle
+        into the second. Measured, before this replaced it: a 0.37 m
+        penetration on exactly that arrangement.
+        """
+        px, py = self._x, self._y
+        ux, uy = math.cos(theta), math.sin(theta)
+        for f in self._live_fires():
+            # A pass buffer on top of the keep-out. Without it the search
+            # returns the first heading that is exactly tangent to the circle,
+            # so the vehicle grazes the boundary with nothing in hand - and
+            # this is a skid-steer that scrubs sideways when it turns, so
+            # exactly-tangent in the plan is inside it on the ground.
+            keep = self._fire_keepout(f) + self._fire_pass
+            fx, fy = f.x - px, f.y - py
+            along = fx * ux + fy * uy
+            if along <= 0.0:
+                continue                       # behind the heading
+            if along > reach:
+                continue                       # further than we are looking
+            perp = abs(fx * -uy + fy * ux)
+            if perp < keep:
+                return False
+        return True
+
+    def _fire_detour(self, gx, gy):
+        """A heading that does not take the vehicle through a fire.
+
+        The reactive controller drives at whatever it is aimed at, so "do not
+        cross a fire" has to be expressed as "do not aim across one". The goal
+        bearing is tried first; if it is blocked, headings are tried fanning
+        out from it until one is clear for ~fire_lookahead metres, and the
+        vehicle is aimed along that instead.
+
+        Two properties matter more than the search itself.
+
+        Every candidate is checked against *every* fire, so a deviation chosen
+        to miss one cannot deliver the vehicle into another.
+
+        And the side is sticky. Fanning out symmetrically and taking the first
+        clear heading flips between left and right when the vehicle is pointed
+        nearly straight at a fire, because the two sides are then equally good
+        and the tie is broken by floating-point noise. The result is a vehicle
+        that grinds on the spot instead of going round: measured at four
+        minutes within a metre of one point, with the dam 11 m away and both
+        tenders ending up inside a fire. So whichever side is picked is held
+        for ~avoid_hold and tried first next tick - the same treatment, and for
+        the same reason, as the laser deflection above.
+
+        This is not a planner. It cannot route out of a pocket formed by three
+        fires and a stand of timber; what it guarantees is that the vehicle
+        never steers into flame, which is the failure that was happening. With
+        move_base up, this job belongs to the costmap and none of it runs.
+        """
+        px, py = self._x, self._y
+        vx, vy = gx - px, gy - py
+        seg = math.hypot(vx, vy)
+        if seg < 1e-3 or not self._live_fires():
+            self._detour_side = None
+            return gx, gy
+
+        # Already inside one - a fire can light on top of a standing tender.
+        # Nothing else matters until it is out, and steering for the goal from
+        # in here would drive along the fire rather than off it.
+        worst = None
+        for f in self._live_fires():
+            d = math.hypot(px - f.x, py - f.y) - self._fire_keepout(f)
+            if worst is None or d < worst[0]:
+                worst = (d, f)
+        if worst[0] < 0.0:
+            f = worst[1]
+            ax, ay = px - f.x, py - f.y
+            n = math.hypot(ax, ay) or 1.0
+            return px + ax / n * 2.0, py + ay / n * 2.0
+
+        reach = min(seg, self._fire_look)
+        goal_bear = math.atan2(vy, vx)
+        if self._heading_clear(goal_bear, reach):
+            self._detour_side = None
+            return gx, gy
+
+        now = rospy.Time.now()
+        if self._detour_side is None or now >= self._detour_until:
+            # No commitment in force. Pick the side the goal actually lies on
+            # relative to the blocking fire, which is the short way round.
+            f = min(self._live_fires(),
+                    key=lambda h: math.hypot(px - h.x, py - h.y))
+            cross = vx * (f.y - py) - vy * (f.x - px)
+            self._detour_side = 1.0 if cross < 0.0 else -1.0
+
+        for deg in range(5, 100, 5):
+            for side in (self._detour_side, -self._detour_side):
+                theta = goal_bear + side * math.radians(deg)
+                if self._heading_clear(theta, reach):
+                    if side != self._detour_side:
+                        self._detour_side = side
+                    self._detour_until = now + rospy.Duration(self._avoid_hold)
+                    return (px + reach * math.cos(theta),
+                            py + reach * math.sin(theta))
+
+        # Boxed in. Back away from the nearest fire rather than pressing on.
+        f = worst[1]
+        ax, ay = px - f.x, py - f.y
+        n = math.hypot(ax, ay) or 1.0
+        return px + ax / n * 2.0, py + ay / n * 2.0
+
+    def _stand_point(self, fire):
+        """Where to park for a given fire, or None if nowhere near it is safe.
+
+        Beside it, not on it - the crew ring is over the fire and three
+        aircraft come down inside it. First choice is the side facing the arena
+        centre, because that is the side most drones arrive from, so the
+        vehicle is out of the approach rather than under it.
+
+        If that lands too close to a trunk the bearing is walked round the fire
+        until something clears. A tender is free to stand anywhere on the
+        circle; only the aircraft above it care which.
+        """
+        d = math.hypot(fire.x, fire.y)
+        if d < 1e-3:
+            base = -math.pi / 2.0
+        else:
+            base = math.atan2(-fire.y, -fire.x)
+
+        # The standoff has to clear this fire's own keep-out, and a 10 burns
+        # wider than a 1. At the fixed 2.0 m a intensity-10 fire put the
+        # standing point 0.05 m outside its own keep-out disc, so the tender
+        # arrived, tripped its own fire caution and crept for the rest of the
+        # job - correct behaviour from an incorrect place to stand. Standing
+        # further from a bigger fire is what was meant all along.
+        stand_r = max(self._standoff, self._fire_keepout(fire) + 0.30)
+
+        for step in (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6):
+            theta = base + step * (math.pi / 6.0)
+            x = fire.x + stand_r * math.cos(theta)
+            y = fire.y + stand_r * math.sin(theta)
+            if abs(x) >= self._fence or abs(y) >= self._fence:
+                continue
+            if self._clear_of_trees(x, y):
+                return (x, y)
+        return None
+
+    def _choose_stand(self):
+        """The best place to be standing, or None if there is no work at all.
+
+        Scored on crew per second of driving. A fire with nobody on it is
+        skipped entirely: the aircraft have not chosen it, so no water is being
+        spent there and standing next to it serves nobody.
+        """
+        best, best_score, best_fire = None, 0.0, -1
+        for fire in self._board:
+            if fire.crew <= 0:
+                continue
+            point = self._stand_point(fire)
+            if point is None:
+                # Nowhere round this fire leaves the aircraft clear of the
+                # timber. Somebody else's fire is a better place to be.
+                continue
+            if self._peer_blocks(*point):
+                continue
+            drive = math.hypot(point[0] - self._x, point[1] - self._y)
+            # +2.0 so a fire the vehicle is already beside does not score
+            # infinitely and pin it there while a bigger crew works elsewhere.
+            score = fire.crew / (drive / max(self._lin_speed, 0.1) + 2.0)
+            if score > best_score:
+                best, best_score, best_fire = point, score, fire.id
+        return best, best_fire
+
+    def _dock_point(self):
+        """This tender's numbered slot on the ring around the dam.
+
+        There is one dam and two vehicles that both need it, and unlike a
+        standing point there is no second choice to fall back on - so the
+        conflict is removed by geometry instead of by negotiation.
+
+        The slots are spread about the bearing from the dam *towards the arena*
+        rather than drawn blindly round the full circle, and that is not
+        tidiness. The dam sits in a corner at (8.5, 8.5) with the firebreak at
+        +-10, so a full ring puts slot 1 of 2 at (10.10, 8.50) - through the
+        wall. The soft fence then clamped it to 9.40, which is 0.90 m from the
+        dam centre and therefore *inside the kerb*: a goal in the middle of a
+        solid obstacle, which the vehicle can never reach and so drives at
+        forever. Measured exactly that - scout_1 stuck in DAM for the whole run,
+        wedged against a tree with scout_0 jammed behind it.
+
+        ~dock_spread is wide enough that two slots on the ring are further
+        apart than the vehicles are wide: at 1.2 rad on a 1.6 m ring the chord
+        is 1.81 m against a 1.28 m touching distance.
+        """
+        if self._dam is None:
+            return None
+        dx, dy, _ = self._dam
+        toward_arena = math.atan2(-dy, -dx)
+        if self._dock_n <= 1:
+            theta = toward_arena
+        else:
+            theta = toward_arena + self._dock_spread * (
+                self._dock_i - (self._dock_n - 1) / 2.0)
+        return (dx + self._dock_rad * math.cos(theta),
+                dy + self._dock_rad * math.sin(theta))
+
+    def _decide(self):
+        """Pick the state and the goal. Called once per control tick."""
+        now = rospy.Time.now()
+
+        # Water first, always. A tender that runs dry among the fires has
+        # aircraft committed to flying at it and nothing to give them, which
+        # costs the whole fleet rather than just this vehicle.
+        if self._state != 'DAM' and self._litres < self._reserve:
+            rospy.loginfo('[%s] down to %.0f L - going to the dam',
+                          self._ns, self._litres)
+            self._state = 'DAM'
+            self._goal = None
+            self._goal_fire = -1
+
+        if self._state == 'DAM':
+            if self._litres >= self._full:
+                rospy.loginfo('[%s] full at %.0f L - back to the fire ground',
+                              self._ns, self._litres)
+                self._state = 'DRIVE'
+                self._goal = None
+                self._picked_at = rospy.Time(0)
+            else:
+                self._goal = self._dock_point()
+                self._goal_fire = -1
+                return
+
+        # Re-examine the standing choice periodically rather than every tick.
+        # The board changes at 10 Hz and a skid-steer vehicle that re-aims at
+        # 10 Hz spends the run turning on the spot.
+        stale = (now - self._picked_at).to_sec() > self._repick
+        if self._goal is None or stale:
+            point, fire_id = self._choose_stand()
+            self._picked_at = now
+            if point is not None:
+                if self._goal is None or math.hypot(point[0] - self._goal[0],
+                                                    point[1] - self._goal[1]) > 0.5:
+                    self._goal = point
+                    self._goal_fire = fire_id
+                    if self._state == 'STAND':
+                        self._state = 'DRIVE'
+            else:
+                # Nothing crewed anywhere, or everything worth standing by is
+                # taken. Wait near the middle - the shortest average drive to
+                # wherever work next appears - on this tender's own side of it.
+                idle = self._idle_point()
+                if self._goal is None or self._goal_fire >= 0:
+                    self._goal = idle
+                    self._goal_fire = -1
+                    if self._state == 'STAND':
+                        self._state = 'DRIVE'
+
+        if self._goal is not None:
+            claim = TenderClaim()
+            claim.scout = self._ns
+            claim.x, claim.y = self._goal
+            claim.fire_id = self._goal_fire
+            self._claim_pub.publish(claim)
+
+    # ------------------------------------------------------ laser helpers ---
+    def _sector_min(self, deg_from, deg_to):
+        """Minimum valid range in an angular sector, degrees, 0 = forward.
+
+        Index-to-angle comes from angle_min and angle_increment rather than
+        assuming a full circle: this scan is 200 degrees, and the shortcut that
+        works for a 360-degree scanner would rotate every sector silently.
+        """
+        scan = self._scan
+        if scan is None:
+            return float('inf')
+
+        floor = max(scan.range_min, self._min_range)
+        a = deg_from % 360.0
+        b = deg_to % 360.0
+        best = float('inf')
+        for i, r in enumerate(scan.ranges):
+            if not math.isfinite(r) or not (floor < r < scan.range_max):
+                continue
+            deg = math.degrees(scan.angle_min + i * scan.angle_increment) % 360.0
+            in_sector = (a <= deg <= b) if a <= b else (deg >= a or deg <= b)
+            if in_sector and r < best:
+                best = r
+        return best
+
+    def _safety_filter(self, cmd, away_from=None):
+        """Three sectors, the same shape the aircraft use.
+
+        The Scout has no reverse gear problem and no preferred direction, so
+        the fully-blocked branch backs off and turns exactly as the drones' do.
+        What is different is that this vehicle cannot strafe out of trouble, so
+        the deflection has to be committed to for ~avoid_hold - re-aiming the
+        instant the front sector clears turns it straight back into the trunk
+        it just got past.
+        """
+        front = self._sector_min(330.0, 30.0)
+        if front > self._avoid_dist:
+            self._avoiding = False
+            return cmd
+
+        self._avoiding = True
+        self._avoid_until = rospy.Time.now() + rospy.Duration(self._avoid_hold)
+        left = self._sector_min(15.0, 85.0)
+        right = self._sector_min(275.0, 345.0)
+        turn_left = left >= right
+
+        if front <= self._stop_dist:
+            # Reversing is the escape from a trunk, but while retreating from a
+            # fire it can be the thing that undoes the escape: the retreat has
+            # just turned the vehicle's back on the fire, so reverse points
+            # straight at it. Blanket-banning reverse is worse - a vehicle
+            # wedged between a trunk and a fire then has no way out at all, and
+            # measured that way scout_1 spent 21% of a run inside a keep-out
+            # against 2.5% before. So the test is directional: reverse unless
+            # reversing would move *towards* the fire being escaped.
+            block = False
+            if away_from is not None:
+                rx = -math.cos(self._yaw)
+                ry = -math.sin(self._yaw)
+                block = ((away_from[0] - self._x) * rx +
+                         (away_from[1] - self._y) * ry) > 0.0
+            cmd.linear.x = 0.0 if block else -self._back_off
+            cmd.angular.z = self._max_ang if turn_left else -self._max_ang
+        else:
+            ratio = ((front - self._stop_dist) /
+                     (self._avoid_dist - self._stop_dist))
+            cmd.linear.x *= ratio
+            avoid_w = self._max_ang * (1.0 - ratio)
+            if turn_left:
+                cmd.angular.z = min(self._max_ang, cmd.angular.z + avoid_w)
+            else:
+                cmd.angular.z = max(-self._max_ang, cmd.angular.z - avoid_w)
+        return cmd
+
+    # ---------------------------------------------------------- move_base ---
+    def _navigate(self, gx, gy):
+        """Hand the driving to move_base. Returns True while it is in charge.
+
+        The division of labour is the point: this node decides *where* a water
+        point should be, which is the only part of it that is about the
+        scenario, and move_base works out how to get there over the shared map.
+        Everything below this method - the heading controller, the three-sector
+        laser filter - is what it does when the navigation stack is not there.
+
+        Goals are re-sent only when the destination actually moves. move_base
+        preempts on a new goal, so re-sending the same one every tick would
+        restart the global plan ten times a second and the vehicle would crawl.
+        """
+        moved = (self._nav_goal is None or
+                 math.hypot(gx - self._nav_goal[0], gy - self._nav_goal[1]) > 0.35)
+
+        if moved:
+            goal = MoveBaseGoal()
+            goal.target_pose.header.frame_id = 'map'
+            goal.target_pose.header.stamp = rospy.Time.now()
+            goal.target_pose.pose.position.x = gx
+            goal.target_pose.pose.position.y = gy
+            # Point the vehicle the way it was travelling. The yaw tolerance is
+            # wide open in the planner config because which way a water point
+            # faces means nothing - this is only so it does not arrive facing
+            # backwards for no reason.
+            yaw = math.atan2(gy - self._y, gx - self._x)
+            q = quaternion_from_euler(0.0, 0.0, yaw)
+            goal.target_pose.pose.orientation.x = q[0]
+            goal.target_pose.pose.orientation.y = q[1]
+            goal.target_pose.pose.orientation.z = q[2]
+            goal.target_pose.pose.orientation.w = q[3]
+            self._nav.send_goal(goal)
+            self._nav_goal = (gx, gy)
+            if self._state != 'DAM':
+                self._state = 'DRIVE'
+
+        state = self._nav.get_state()
+        arrived = (math.hypot(gx - self._x, gy - self._y) <= self._arrive_rad)
+
+        if state == GoalStatus.SUCCEEDED or arrived:
+            # Stop dead and stay stopped. A tender is only `ready` to be
+            # hovered over while it is stationary, and move_base left with a
+            # completed goal will still nudge, so the goal is cancelled rather
+            # than left to settle.
+            if self._state != 'STAND' and self._state != 'DAM':
+                rospy.loginfo('[%s] standing at (%.2f, %.2f)%s', self._ns,
+                              self._x, self._y,
+                              ' by fire %d' % self._goal_fire
+                              if self._goal_fire >= 0 else '')
+            if state != GoalStatus.SUCCEEDED:
+                self._nav.cancel_goal()
+            if self._state != 'DAM':
+                self._state = 'STAND'
+            self._cmd_pub.publish(Twist())
+            return True
+
+        if state in (GoalStatus.ABORTED, GoalStatus.REJECTED):
+            # Unreachable. Do not grind through it - there is almost always a
+            # second-best fire to stand beside and the fleet is waiting on this
+            # vehicle, so drop the choice and let _decide pick again.
+            rospy.logwarn_throttle(10.0,
+                                   '[%s] move_base could not reach (%.2f, %.2f)'
+                                   ' - choosing somewhere else',
+                                   self._ns, gx, gy)
+            self._nav_goal = None
+            self._goal = None
+            self._picked_at = rospy.Time(0)
+            return True
+
+        return True
+
+    # ------------------------------------------------------------ stuck ---
+    def _check_stuck(self):
+        """Notice that this vehicle has stopped getting anywhere.
+
+        Only for the reactive path. A three-sector filter can deflect but it
+        cannot plan, so anything concave - a tree with another Scout behind it,
+        a corner of the firebreak - is a place it will sit and grind against
+        forever. Measured: both tenders stationary for the rest of a run, 0.85 m
+        apart, one of them 0.31 m into a trunk.
+
+        move_base has real recovery behaviours, so this is switched off
+        entirely when it is driving.
+        """
+        now = rospy.Time.now()
+        here = (self._x, self._y)
+        if self._moved_from is None:
+            self._moved_from, self._moved_at = here, now
+            return False
+        if math.hypot(here[0] - self._moved_from[0],
+                      here[1] - self._moved_from[1]) > self._stuck_dist:
+            self._moved_from, self._moved_at = here, now
+            return False
+        if (now - self._moved_at).to_sec() < self._stuck_time:
+            return False
+
+        rospy.logwarn('[%s] stuck at (%.2f, %.2f) for %.0f s - backing out',
+                      self._ns, self._x, self._y, self._stuck_time)
+        self._escape_until = now + rospy.Duration(self._escape_time)
+        # Turn away from whichever side is more blocked, and alternate if it
+        # happens again, so two attempts never repeat the same failed move.
+        left = self._sector_min(15.0, 85.0)
+        right = self._sector_min(275.0, 345.0)
+        self._escape_turn = 1.0 if left >= right else -1.0
+        self._moved_from, self._moved_at = here, now
+        # Give the standing choice up as well: whatever this vehicle was trying
+        # to reach, it has just proved it cannot get there from here.
+        self._goal = None
+        self._picked_at = rospy.Time(0)
+        return True
+
+    # ------------------------------------------------------- control loop ---
+    def _control_loop(self, _event):
+        if not self._odom_ready:
+            return
+
+        self._decide()
+        cmd = Twist()
+
+        if self._goal is None:
+            self._cmd_pub.publish(cmd)
+            return
+
+        gx, gy = self._goal
+        # Soft fence. The arena is walled and this vehicle is heavy enough to
+        # push a wall rather than be stopped by it, so keep the goal inside.
+        gx = _clamp(gx, -self._fence, self._fence)
+        gy = _clamp(gy, -self._fence, self._fence)
+
+        # Getting out of a fire is done in BOTH driving modes, so it is tested
+        # before the handover rather than after it.
+        #
+        # This is where turning the navigation stack on quietly removed the
+        # whole of this node's fire handling: everything below the handover is
+        # move_base's job, and the escape used to be below it. A fire that lit
+        # onto a standing tender then left it sitting in the flames while
+        # move_base reported it had arrived - which, by its costmap, it had.
+        #
+        # The goal is cancelled first. Driving out while move_base is still
+        # steering towards a point inside the fire is two controllers on one
+        # /cmd_vel, and the one that publishes last wins.
+        inside = self._inside_fire()
+        if inside is not None:
+            if self._nav is not None:
+                self._nav.cancel_goal()
+                self._nav_goal = None
+            self._drive_out_of_fire(inside, cmd)
+            return
+
+        # With the navigation stack up, everything below this is move_base's
+        # job and none of it runs - including the stuck escape, which would
+        # fight move_base's own recovery behaviours.
+        if self._nav is not None:
+            self._navigate(gx, gy)
+            return
+
+        # Reverse out of whatever this vehicle has wedged itself into. Checked
+        # before anything else steers, because the steering is what got it here.
+        if rospy.Time.now() < self._escape_until:
+            cmd.linear.x = -self._back_off
+            cmd.angular.z = self._escape_turn * self._max_ang
+            self._cmd_pub.publish(cmd)
+            return
+        if self._state in ('DRIVE', 'DAM') and self._check_stuck():
+            return
+
+        # The escape itself now lives in _drive_out_of_fire and is called
+        # above, before the move_base handover, so it runs in both driving
+        # modes. All that is left here is clearing the latch once clear.
+        self._retreating = False
+
+        # Distance and arrival are judged against the real goal; only the
+        # steering is allowed to be deflected. Aiming at a tangent point and
+        # then measuring arrival against it would have the vehicle "arrive"
+        # beside a fire it was merely driving around.
+        dx, dy = gx - self._x, gy - self._y
+        dist = math.hypot(dx, dy)
+
+        arrive = self._arrive_rad
+        if self._state == 'DAM':
+            # Close enough to draw is what matters at the dam, not close
+            # enough to look tidy - the controller stops it inside the draw
+            # radius and the ledger does the rest.
+            arrive = max(arrive, 0.30)
+
+        if dist <= arrive:
+            # Arrived. Stop dead: a tender is only `ready` to be hovered over
+            # while it is stationary, so creeping about costs it its whole
+            # purpose. That check is made in the ledger from this vehicle's
+            # own odometry, which is why publishing a zero Twist is not a
+            # formality here.
+            if self._state != 'DAM':
+                if self._state != 'STAND':
+                    rospy.loginfo('[%s] standing at (%.2f, %.2f)%s',
+                                  self._ns, self._x, self._y,
+                                  ' by fire %d' % self._goal_fire
+                                  if self._goal_fire >= 0 else '')
+                self._state = 'STAND'
+            self._cmd_pub.publish(cmd)
+            return
+
+        if self._state == 'STAND':
+            self._state = 'DRIVE'
+
+        # Steer at a point that misses every burning fire, not at the goal.
+        ax, ay = self._fire_detour(gx, gy)
+        angle_err = _normalize_angle(math.atan2(ay - self._y,
+                                                ax - self._x) - self._yaw)
+
+        if abs(angle_err) > self._angle_tol and rospy.Time.now() >= self._avoid_until:
+            # Turn on the spot first. Skid-steer scrubs badly when it tries to
+            # do both at once, and the tolerance is loose for the same reason:
+            # holding a heading tighter than the vehicle can is just wheelspin.
+            cmd.angular.z = _clamp(self._ang_gain * angle_err,
+                                   -self._max_ang, self._max_ang)
+            self._cmd_pub.publish(self._safety_filter(cmd))
+            return
+
+        speed_factor = min(1.0, max(0.25, dist / self._slow_dist))
+        cmd.linear.x = self._lin_speed * speed_factor
+
+        # Take care near fire. Applied after the distance taper and before the
+        # laser filter, so the three limits compose: approach slowly, creep
+        # near flame, and still brake for a trunk.
+        cap, hot = self._fire_speed_cap(self._x, self._y)
+        if cap is not None and cmd.linear.x > cap:
+            cmd.linear.x = cap
+            if hot is not None and not self._fire_warned:
+                rospy.loginfo('[%s] easing off - fire %d (intensity %.0f) '
+                              'at %.1f m', self._ns, hot.id, hot.intensity,
+                              math.hypot(self._x - hot.x, self._y - hot.y))
+                self._fire_warned = True
+        elif cap is None:
+            self._fire_warned = False
+
+        cmd.angular.z = _clamp(self._ang_gain * angle_err,
+                               -self._max_ang, self._max_ang)
+        self._cmd_pub.publish(self._safety_filter(cmd))
+
+
+def main():
+    WaterTender()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()
